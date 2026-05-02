@@ -1,0 +1,14 @@
+# ── Runtime ───────────────────────────────────────────────────────────
+aiohttp>=3.9.0          # async HTTP client
+aiofiles>=23.0.0        # async file I/O  (Day 6 JSONStorage / CSVStorage)
+aiosqlite>=0.19.0       # async SQLite    (Day 6 SQLiteStorage)
+beautifulsoup4>=4.12.0  # HTML parsing    (Day 2)
+lxml>=5.0.0             # fast HTML/XML parser for BeautifulSoup + sitemap
+
+# ── Optional but recommended ──────────────────────────────────────────
+PyYAML>=6.0             # YAML config files (Day 7); JSON config works without it
+
+# ── Testing ───────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+aioresponses>=0.7.6     # mock aiohttp responses in tests

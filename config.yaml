@@ -1,0 +1,30 @@
+# async_crawler/config.yaml
+# Example configuration file for AdvancedCrawler.
+# Use with: python advanced_crawler.py --config config.yaml
+
+start_urls:
+  - https://example.com
+
+max_pages: 20
+max_depth: 2
+max_concurrent: 5
+requests_per_second: 1.0
+min_delay: 0.5
+jitter: 0.3
+respect_robots: true
+same_domain_only: true
+
+# URL filters (regex patterns)
+exclude_patterns:
+  - "\\.pdf$"
+  - "\\.jpg$"
+  - "\\.png$"
+
+# Output formats (comment out any you don't need)
+output:
+  json: results.jsonl
+  csv: results.csv
+  sqlite: results.db
+
+# Optional log file
+# log_file: crawler.log

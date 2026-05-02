@@ -1,0 +1,42 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyCharm
+.idea/
+
+# Test/cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Generated result files
+books.csv
+books.json
+books.db
+
+results_day2.json
+results_day3.json
+results_day6.csv
+results_day6.db
+results_day6.jsonl
+
+stats_day7.json
+report_day7.html
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets
+.env
