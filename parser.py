@@ -57,6 +57,8 @@ def _empty_page_data(url: str) -> dict:
         "metadata":     {"title": None, "description": None, "keywords": None},
         "tables_count": 0,
         "lists_count":  0,
+        "tables":       [],   # list of dicts, each with "headers" and "rows"
+        "lists":        [],   # list of dicts, each with "tag" and "items"
         "error":        None,
     }
 
@@ -140,10 +142,16 @@ class HTMLParser:
             logger.warning("Heading extraction failed for %s: %s", url, exc)
 
         try:
-            result["tables_count"] = len(soup.find_all("table"))
-            result["lists_count"] = len(soup.find_all(["ul", "ol"]))
+            result["tables"] = self.extract_tables(soup)
+            result["tables_count"] = len(result["tables"])
         except Exception as exc:
-            logger.warning("Table/list count failed for %s: %s", url, exc)
+            logger.warning("Table extraction failed for %s: %s", url, exc)
+
+        try:
+            result["lists"] = self.extract_lists(soup)
+            result["lists_count"] = len(result["lists"])
+        except Exception as exc:
+            logger.warning("List extraction failed for %s: %s", url, exc)
 
         return result
 
@@ -336,6 +344,77 @@ class HTMLParser:
                     headings[level].append(text)
 
         return headings
+
+
+    def extract_tables(self, soup: BeautifulSoup) -> list[dict]:
+        """
+        Extract ALL tables as structured data.
+
+        Per Day-2 spec: "извлекать таблицы с данными" means returning the
+        actual cell content, not just counting tables.
+
+        Each table is returned as:
+          {
+            "headers": ["Col1", "Col2", ...],   # <th> text from first row
+            "rows":    [["v1", "v2"], ...]       # <td> text from remaining rows
+          }
+
+        WHY collect headers separately?
+          Headers give the data meaning. Without them you just have
+          anonymous lists of values.
+        """
+        tables = []
+        for table in soup.find_all("table"):
+            headers: list[str] = []
+            rows: list[list[str]] = []
+
+            for i, tr in enumerate(table.find_all("tr")):
+                # First row with <th> cells → treat as header row
+                th_cells = tr.find_all("th")
+                td_cells = tr.find_all("td")
+
+                if th_cells and not headers:
+                    headers = [th.get_text(strip=True) for th in th_cells]
+                elif td_cells:
+                    rows.append([td.get_text(strip=True) for td in td_cells])
+
+            # Only include table if it has actual data
+            if headers or rows:
+                tables.append({"headers": headers, "rows": rows})
+
+        return tables
+
+    def extract_lists(self, soup: BeautifulSoup) -> list[dict]:
+        """
+        Extract ALL <ul> and <ol> lists as structured data.
+
+        Per Day-2 spec: "списков (ul, ol)" means returning the items,
+        not just counting the tags.
+
+        Each list is returned as:
+          {
+            "tag":   "ul" or "ol",
+            "items": ["item text 1", "item text 2", ...]
+          }
+
+        WHY skip nested lists?
+          Nested <ul> inside a <li> would cause the parent list to include
+          the entire nested text. We only collect direct <li> children.
+        """
+        lists = []
+        for lst in soup.find_all(["ul", "ol"]):
+            # find_all("li") would include nested li items from sub-lists.
+            # Using direct children (lst.find_all("li", recursive=False))
+            # gives only the immediate items of THIS list.
+            items = [
+                li.get_text(separator=" ", strip=True)
+                for li in lst.find_all("li", recursive=False)
+                if li.get_text(strip=True)
+            ]
+            if items:
+                lists.append({"tag": lst.name, "items": items})
+
+        return lists
 
     @staticmethod
     def _is_valid_url(url: str) -> bool:

@@ -1,3 +1,4 @@
+import aiohttp
 """
 async_crawler/rate_limiter.py  (Day 4)
 
@@ -225,7 +226,7 @@ class RobotsParser:
         rfp.set_url(robots_url)
 
         try:
-            async with session.get(robots_url, timeout=asyncio.timeout(10)) as resp:
+            async with session.get(robots_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     text = await resp.text()
                     # rfp.parse() expects a list of lines, not one big string
