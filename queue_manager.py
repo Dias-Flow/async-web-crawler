@@ -85,10 +85,23 @@ class CrawlerQueue:
         rec = self._index.get(url)
         return rec.depth if rec else 0
 
-    def mark_visited(self, url: str) -> None:
+    def mark_processed(self, url: str, error: str = None) -> None:
+        """
+        Mark a URL as done. Per Day-3 spec the method is called mark_processed().
+        If error is provided the URL is marked as "failed", otherwise "visited".
+        task_done() is required by asyncio.PriorityQueue bookkeeping.
+        """
         if url in self._index:
-            self._index[url].state = "visited"
+            if error:
+                self._index[url].state = "failed"
+                self._index[url].error = error
+            else:
+                self._index[url].state = "visited"
         self._queue.task_done()
+
+    def mark_visited(self, url: str) -> None:
+        """Alias for mark_processed() kept for backward compatibility."""
+        self.mark_processed(url)
 
     def mark_failed(self, url: str, error: str) -> None:
         if url in self._index:

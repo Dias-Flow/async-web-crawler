@@ -365,9 +365,14 @@ class AdvancedCrawler:
                 # TransientError / NetworkError with exponential back-off.
                 try:
                     fetch_result = await self._retry.execute_with_retry(
-                        self._crawler._fetch_url_internal,
+                        self._crawler._do_fetch_raising,
                         url,
-                        url=url,   # passed as kwarg for logging only
+                        url=url,
+                        # _do_fetch_raising RAISES on error (unlike _do_fetch which
+                        # swallows exceptions into FetchResult.error).
+                        # This allows RetryStrategy to catch the exception,
+                        # classify it (Transient/Network/Permanent), and apply
+                        # exponential back-off before retrying.
                     )
                 except CrawlerError as exc:
                     # All retries exhausted — treat as fetch failure

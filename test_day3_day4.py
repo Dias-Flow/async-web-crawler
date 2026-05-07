@@ -38,14 +38,18 @@ class TestCrawlerQueue:
         assert added_again is False
 
     async def test_get_next_returns_url(self):
-        """get_next() should return the URL we just added."""
+        """get_next() returns str|None per Day-3 spec."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com", depth=0)
-        item = await q.get_next()
-        assert item is not None
-        url, depth = item
+        await q.add_url("https://example.com", depth=2)
+        url = await q.get_next()
         assert url == "https://example.com"
-        assert depth == 0
+
+    async def test_get_depth_returns_correct_depth(self):
+        """get_depth() returns the depth stored when the URL was added."""
+        q = CrawlerQueue()
+        await q.add_url("https://example.com", depth=2)
+        await q.get_next()
+        assert q.get_depth("https://example.com") == 2
 
     async def test_get_next_empty_returns_none(self):
         """get_next() on an empty queue should return None, not raise."""
@@ -58,15 +62,15 @@ class TestCrawlerQueue:
         q = CrawlerQueue()
         await q.add_url("https://example.com/low", priority=10)
         await q.add_url("https://example.com/high", priority=1)
-        first, _ = await q.get_next()
+        first = await q.get_next()
         assert first == "https://example.com/high"
 
-    async def test_mark_visited_updates_state(self):
-        """After mark_visited the URL should appear in visited stats."""
+    async def test_mark_processed_updates_state(self):
+        """After mark_processed the URL should appear in visited stats."""
         q = CrawlerQueue()
         await q.add_url("https://example.com")
         await q.get_next()
-        q.mark_visited("https://example.com")
+        q.mark_processed("https://example.com")
         stats = q.get_stats()
         assert stats["visited"] == 1
 

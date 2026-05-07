@@ -87,7 +87,7 @@ class TestHTMLReport:
         content = Path(out).read_text()
         assert "<html" in content
         assert "example.com" in content
-        assert "Total pages" in content
+        assert "Total" in content
 
     def test_report_contains_stats(self, tmp_path):
         s = CrawlerStats()

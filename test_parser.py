@@ -331,7 +331,8 @@ class TestFetchAndParse:
         mock_resp = AsyncMock()
         mock_resp.status = 200
         mock_resp.text = AsyncMock(return_value=FULL_HTML)
-        mock_resp.raise_for_status = MagicMock()
+        mock_resp.raise_for_status = MagicMock()   # sync, like real aiohttp
+        mock_resp.headers = {"Content-Type": "text/html"}  # real dict, not AsyncMock
 
         mock_ctx = AsyncMock()
         mock_ctx.__aenter__ = AsyncMock(return_value=mock_resp)

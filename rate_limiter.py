@@ -233,14 +233,18 @@ class RobotsParser:
                     rfp.parse(text.splitlines())
                     logger.info("robots.txt fetched for %s", origin)
                 else:
-                    # 404 is the most common case — site has no robots.txt.
-                    # RobotFileParser with no rules = allow everything.
-                    logger.debug("No robots.txt at %s (HTTP %d)", robots_url, resp.status)
+                    # 404 is common — site has no robots.txt → allow everything.
+                    # We must explicitly parse an empty allow-all rule because
+                    # an un-parsed RobotFileParser blocks everything by default
+                    # (it treats the file as "unavailable" = disallow all).
+                    rfp.parse(["User-agent: *", "Allow: /"])
+                    logger.debug("No robots.txt at %s (HTTP %d), allowing all", robots_url, resp.status)
 
         except Exception as exc:
-            # Network failure fetching robots.txt → we can't know the rules
-            # → safest interpretation is "allow everything" (empty parser)
-            logger.warning("Could not fetch robots.txt for %s: %s", origin, exc)
+            # Network failure fetching robots.txt → allow everything
+            # Must explicitly set allow-all because un-parsed rfp blocks by default
+            rfp.parse(["User-agent: *", "Allow: /"])
+            logger.warning("Could not fetch robots.txt for %s: %s (allowing all)", origin, exc)
 
         # Cache even on failure so we don't retry on every subsequent page
         self._cache[origin] = rfp
