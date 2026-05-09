@@ -148,6 +148,10 @@ class JSONStorage(DataStorage):
     def __init__(self, filepath: str) -> None:
         self._path = Path(filepath)
         self._saved_count: int = 0
+        # Lock ensures only one coroutine writes at a time.
+        # Without this, concurrent saves produce interleaved bytes
+        # making JSON lines unparseable.
+        self._lock = asyncio.Lock()
 
     async def save(self, data: dict) -> None:
         """
@@ -161,13 +165,12 @@ class JSONStorage(DataStorage):
         line = json.dumps(record, ensure_ascii=False)
 
         try:
-            # mode="a" = append. Creates the file if it doesn't exist.
-            async with aiofiles.open(self._path, mode="a", encoding="utf-8") as f:
-                await f.write(line + "\n")
+            async with self._lock:  # one write at a time
+                async with aiofiles.open(self._path, mode="a", encoding="utf-8") as f:
+                    await f.write(line + "\n")
             self._saved_count += 1
             logger.debug("JSON saved: %s", record["url"])
         except OSError as exc:
-            # Log but don't crash — the crawl continues even if one write fails
             logger.error("JSON write error: %s", exc)
 
     async def close(self) -> None:

@@ -335,6 +335,7 @@ class AsyncCrawler:
         if self.respect_robots:
             self._robots_parser = RobotsParser(user_agent=self._user_agent)
         self._all_done_event = asyncio.Event()
+        self._crawl_tasks: set[asyncio.Task] = set()  # track every spawned task
 
     def _should_crawl(self, url, seed_domain, same_domain_only,
                       exclude_patterns, include_patterns) -> bool:
@@ -447,10 +448,13 @@ class AsyncCrawler:
             self._all_done_event.clear()
             depth = self._queue.get_depth(url)
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._crawl_one(url, depth, seed_domain,
                                 same_domain_only, exclude_patterns, include_patterns)
             )
+            self._crawl_tasks.add(task)
+            # discard() removes the task from the set when it finishes
+            task.add_done_callback(self._crawl_tasks.discard)
 
             now = time.perf_counter()
             if now - last_log >= 5:
@@ -463,6 +467,14 @@ class AsyncCrawler:
                     self._active_tasks, stats["failed"], speed,
                 )
                 last_log = now
+
+        # Wait for every in-flight worker to finish before returning.
+        # Without this, tasks spawned just before max_pages was hit are
+        # still running after crawl() returns, mutating visited_urls and
+        # potentially using a closed aiohttp session.
+        if self._crawl_tasks:
+            logger.info("Waiting for %d in-flight tasks...", len(self._crawl_tasks))
+            await asyncio.gather(*list(self._crawl_tasks), return_exceptions=True)
 
         elapsed = time.perf_counter() - t0
         logger.info(

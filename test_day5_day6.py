@@ -281,3 +281,36 @@ class TestMultiStorage:
 
 # ---------------------------------------------------------------------------
 from unittest.mock import MagicMock
+
+
+# ===========================================================================
+# JSONStorage concurrency test (Fix 3)
+# ===========================================================================
+class TestJSONStorageConcurrency:
+
+    async def test_concurrent_saves_produce_valid_json_lines(self, tmp_path):
+        """
+        20 concurrent saves must each produce exactly one valid JSON line.
+        Before the Lock fix, interleaved writes could corrupt lines.
+        """
+        path = str(tmp_path / "concurrent.jsonl")
+        storage = JSONStorage(path)
+
+        rec = {"url": "https://x.com", "title": "T", "text": "",
+               "links": [], "metadata": {}, "text_length": 0, "links_count": 0}
+
+        # Fire 20 saves at exactly the same time
+        await asyncio.gather(*[
+            storage.save({**rec, "url": f"https://x.com/{i}"})
+            for i in range(20)
+        ])
+        await storage.close()
+
+        lines = Path(path).read_text().strip().splitlines()
+        assert len(lines) == 20, f"Expected 20 lines, got {len(lines)}"
+        for i, line in enumerate(lines):
+            obj = json.loads(line)   # raises if line is corrupt
+            assert "url" in obj
+
+import json
+from pathlib import Path

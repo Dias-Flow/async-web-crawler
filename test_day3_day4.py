@@ -287,3 +287,34 @@ class TestRobotsParser:
         rp.can_fetch(rfp, "https://example.com/page1")
         rp.can_fetch(rfp, "https://example.com/page2")
         assert rp.get_stats()["total_blocked"] == 2
+
+
+# ===========================================================================
+# Task tracking tests (Fix 1)
+# ===========================================================================
+class TestCrawlerQueueTaskTracking:
+
+    async def test_crawl_tasks_set_exists_after_init(self):
+        """_crawl_tasks set must be created by _init_crawl_components."""
+        from crawler import AsyncCrawler
+        async with AsyncCrawler() as c:
+            c._init_crawl_components()
+            assert hasattr(c, "_crawl_tasks")
+            assert isinstance(c._crawl_tasks, set)
+            assert len(c._crawl_tasks) == 0
+
+
+# ===========================================================================
+# robots.txt block counted in failed_urls (Fix 2) — queue_manager level
+# ===========================================================================
+class TestRobotsBlockInFailedUrls:
+
+    async def test_mark_failed_stores_error(self):
+        """mark_failed should store the error message in URLRecord."""
+        q = CrawlerQueue()
+        await q.add_url("https://example.com/private")
+        await q.get_next()
+        q.mark_failed("https://example.com/private", "blocked by robots.txt")
+        failed = q.get_failed()
+        assert "https://example.com/private" in failed
+        assert failed["https://example.com/private"] == "blocked by robots.txt"

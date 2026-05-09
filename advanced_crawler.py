@@ -349,6 +349,8 @@ class AdvancedCrawler:
                 if not self._crawler._robots_parser.can_fetch(rfp, url):
                     logger.info("robots.txt SKIP: %s", url)
                     self._crawler._queue.mark_failed(url, "blocked by robots.txt")
+                    # Fix: also record in failed_urls so CrawlerStats counts it
+                    self._crawler.failed_urls[url] = "blocked by robots.txt"
                     return
                 crawl_delay = self._crawler._robots_parser.get_crawl_delay(rfp)
                 if crawl_delay:
@@ -478,7 +480,7 @@ class AdvancedCrawler:
             self._crawler._all_done_event.clear()
             depth = self._crawler._queue.get_depth(url)
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self._crawl_one_with_retry(
                     url, depth, seed_domain,
                     self.same_domain_only,
@@ -486,6 +488,8 @@ class AdvancedCrawler:
                     self.include_patterns,
                 )
             )
+            self._crawler._crawl_tasks.add(task)
+            task.add_done_callback(self._crawler._crawl_tasks.discard)
 
             now = time.perf_counter()
             if now - last_log >= 5:
@@ -498,6 +502,10 @@ class AdvancedCrawler:
                     self._crawler._active_tasks, speed,
                 )
                 last_log = now
+
+        # Await any tasks that were still running when the loop exited
+        if self._crawler._crawl_tasks:
+            await asyncio.gather(*list(self._crawler._crawl_tasks), return_exceptions=True)
 
         self.results = self._crawler.processed_urls
 
