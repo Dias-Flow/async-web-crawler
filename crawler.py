@@ -25,6 +25,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import aiohttp
+# RetryStrategy imported lazily inside __init__ to avoid circular imports
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +72,7 @@ class AsyncCrawler:
         respect_robots: bool = True,
         user_agent: str = "AsyncCrawler/1.0 (educational project; aiohttp)",
         storage=None,   # Day 6: DataStorage instance, auto-saves after each page
+        retry_strategy=None,  # Day 5: RetryStrategy; created with defaults if None
     ) -> None:
         self.max_concurrent = max_concurrent
         self.max_retries = max_retries
@@ -103,6 +105,21 @@ class AsyncCrawler:
 
         # Day 6: storage lives in AsyncCrawler per spec
         self.storage = storage
+
+        # Day 5: RetryStrategy is part of AsyncCrawler per spec.
+        # If none provided, create a default one with the given max_retries.
+        # This handles transient errors (503, 429, timeout) with exponential
+        # backoff so the crawler is polite under load.
+        if retry_strategy is None:
+            from retry_strategy import RetryStrategy
+            self.retry_strategy = RetryStrategy(
+                max_retries=max_retries,
+                backoff_base=1.0,
+                backoff_factor=2.0,
+                max_backoff=60.0,
+            )
+        else:
+            self.retry_strategy = retry_strategy
 
         self._queue = None
         self._sem_manager = None
@@ -163,19 +180,33 @@ class AsyncCrawler:
             return await self._fetch_with_retry(url)
 
     async def _fetch_with_retry(self, url: str) -> FetchResult:
-        """Retry loop - retries on network errors, not on HTTP 4xx/5xx."""
-        last: Optional[FetchResult] = None
-        for attempt in range(1, self.max_retries + 2):
-            result = await self._do_fetch(url, attempt)
-            if result.success:
-                return result
-            last = result
-            if result.status is not None:
-                return result   # HTTP error - deterministic, don't retry
-            if attempt <= self.max_retries:
-                logger.warning("Retrying %s (attempt %d)", url, attempt + 1)
-                await asyncio.sleep(self.retry_delay)
-        return last
+        """
+        Retry loop using self.retry_strategy (Day 5 integration).
+
+        Uses _do_fetch_raising so RetryStrategy can see real exceptions and:
+          - retry 503 / 429 / timeout with exponential backoff  (TransientError)
+          - retry DNS / connection errors                        (NetworkError)
+          - NOT retry 404 / 403                                  (PermanentError)
+
+        On permanent failure or exhausted retries, catches the exception and
+        returns a FetchResult(error=...) so callers never have to handle exceptions.
+        """
+        from retry_strategy import CrawlerError
+        try:
+            return await self.retry_strategy.execute_with_retry(
+                self._do_fetch_raising, url, url=url
+            )
+        except CrawlerError as exc:
+            # Permanent error or all retries exhausted — map back to FetchResult
+            status = getattr(exc.__cause__, "status", None) if exc.__cause__ else None
+            # Try to extract HTTP status from the message string as fallback
+            if status is None:
+                import re as _re
+                m = _re.search(r"HTTP (\d+)", str(exc))
+                status = int(m.group(1)) if m else None
+            return FetchResult(url=url, status=status, error=str(exc))
+        except Exception as exc:
+            return FetchResult(url=url, error=f"Unexpected: {exc}")
 
     async def _do_fetch(self, url: str, attempt: int) -> FetchResult:
         """
@@ -453,6 +484,14 @@ class AsyncCrawler:
         return stats
 
     async def close(self) -> None:
+        # Fix: flush and close storage BEFORE closing the session,
+        # so any final SQLite batch flush can still log via the session if needed.
+        # Without this, SQLiteStorage buffer is lost on process exit.
+        if self.storage:
+            try:
+                await self.storage.close()
+            except Exception as exc:
+                logger.error("Storage close error: %s", exc)
         await self._session.close()
         await asyncio.sleep(0)
         logger.info("AsyncCrawler session closed.")
