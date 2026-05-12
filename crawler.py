@@ -123,12 +123,23 @@ class AsyncCrawler:
 
         self._queue = None
         self._sem_manager = None
-        self._rate_limiter = None
-        self._robots_parser = None
         self._rps = requests_per_second
         self._min_delay = min_delay
         self._jitter = jitter
         self._per_domain_limit = per_domain_limit
+
+        # Day 4: create eagerly so fetch_url/fetch_urls also respect
+        # rate limits and robots.txt, not just crawl().
+        from rate_limiter import RateLimiter, RobotsParser
+        self._rate_limiter = RateLimiter(
+            requests_per_second=requests_per_second,
+            per_domain=True,
+            min_delay=min_delay,
+            jitter=jitter,
+        )
+        self._robots_parser = (
+            RobotsParser(user_agent=user_agent) if respect_robots else None
+        )
 
         self._active_tasks: int = 0
         self._all_done_event: Optional[asyncio.Event] = None
@@ -319,21 +330,13 @@ class AsyncCrawler:
 
     def _init_crawl_components(self) -> None:
         from queue_manager import CrawlerQueue, SemaphoreManager
-        from rate_limiter import RateLimiter, RobotsParser
 
         self._queue = CrawlerQueue()
         self._sem_manager = SemaphoreManager(
             global_limit=self.max_concurrent,
             per_domain_limit=self._per_domain_limit,
         )
-        self._rate_limiter = RateLimiter(
-            requests_per_second=self._rps,
-            per_domain=True,
-            min_delay=self._min_delay,
-            jitter=self._jitter,
-        )
-        if self.respect_robots:
-            self._robots_parser = RobotsParser(user_agent=self._user_agent)
+        # _rate_limiter and _robots_parser already created in __init__
         self._all_done_event = asyncio.Event()
         self._crawl_tasks: set[asyncio.Task] = set()  # track every spawned task
 
@@ -361,14 +364,16 @@ class AsyncCrawler:
         """
         self._active_tasks += 1
         try:
+            # Rate limiting applied inside _do_fetch via _apply_politeness().
+            # Here we only honour Crawl-delay AFTER robots check.
             if self._robots_parser:
-                rfp = await self._robots_parser.fetch_robots(self._session, url)
-                if not self._robots_parser.can_fetch(rfp, url):
+                await self._robots_parser.fetch_robots(url)
+                if not self._robots_parser.can_fetch(url):
                     logger.info("robots.txt SKIP: %s", url)
                     self._queue.mark_processed(url, error="blocked by robots.txt")
                     self.failed_urls[url] = "blocked by robots.txt"
                     return
-                crawl_delay = self._robots_parser.get_crawl_delay(rfp)
+                crawl_delay = self._robots_parser.get_crawl_delay()
                 if crawl_delay:
                     await asyncio.sleep(crawl_delay)
 
@@ -504,6 +509,8 @@ class AsyncCrawler:
                 await self.storage.close()
             except Exception as exc:
                 logger.error("Storage close error: %s", exc)
+        if self._robots_parser:
+            await self._robots_parser.close()
         await self._session.close()
         await asyncio.sleep(0)
         logger.info("AsyncCrawler session closed.")

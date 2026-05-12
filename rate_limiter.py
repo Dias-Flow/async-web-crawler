@@ -1,20 +1,17 @@
-import aiohttp
 """
 async_crawler/rate_limiter.py  (Day 4)
 
-Two classes that make the crawler "polite":
-
-RateLimiter:
-  Enforces a minimum time gap between requests to the same domain.
-  Without this, the crawler would fire 100 requests per second and
-  likely get IP-banned or crash a small server.
-
-RobotsParser:
-  Downloads and reads robots.txt — a file that site owners use to tell
-  crawlers which pages they are NOT allowed to visit.
-  Ignoring robots.txt is considered rude and sometimes illegal.
+FIXES applied (mentor review):
+  1. RateLimiter.acquire(domain=None) — per spec; accepts plain domain
+     ("example.com"), full URL ("https://example.com/page"), or None (global).
+  2. RobotsParser — matches spec API exactly:
+       fetch_robots(base_url: str) -> dict   (no external session param)
+       can_fetch(url: str, user_agent: str = "*") -> bool
+       get_crawl_delay(user_agent: str = "*") -> Optional[float]
+     Manages own aiohttp.ClientSession internally; caches rules per domain.
 """
 
+import aiohttp
 import asyncio
 import logging
 import random
@@ -31,28 +28,17 @@ logger = logging.getLogger("RateLimiter")
 # ===========================================================================
 class RateLimiter:
     """
-    Enforces a minimum delay between HTTP requests to each domain.
+    Enforces a minimum delay between HTTP requests per domain.
 
-    HOW IT WORKS — "last request timestamp" pattern:
-      Before every request we check: when was the last request to this domain?
-      If it was less than (1 / requests_per_second) seconds ago, we sleep
-      for the remaining time. If enough time has passed, we proceed immediately.
+    FIX: acquire() now accepts domain: str | None per Day-4 spec.
+      - None          → global bucket ("_global")
+      - "example.com" → per-domain bucket (plain domain, no scheme)
+      - "https://example.com/page" → extracts netloc automatically
 
-      Example with requests_per_second=2.0 (one request every 0.5s):
-        t=0.00s  Request 1 to example.com → no wait, proceed
-        t=0.10s  Request 2 to example.com → wait 0.40s (need 0.5s gap)
-        t=0.50s  Request 3 to example.com → no wait (0.40s passed since last)
-        t=0.51s  Request 4 to httpbin.org → no wait (different domain!)
-
-    WHY per-domain and not global?
-      With per_domain=True, example.com and httpbin.org each have their
-      own timer. Waiting for example.com does NOT delay httpbin.org.
-      This gives us full politeness without sacrificing parallelism.
-
-    JITTER:
-      Adding a small random delay (0–jitter seconds) makes requests look
-      less robotic. Servers that detect uniform 1.000s intervals may flag
-      you as a bot. Random intervals between 0.8s and 1.3s look more human.
+    WHY this matters:
+      Old signature was acquire(url: str = ""). Passing "example.com" (no scheme)
+      to urlparse gives netloc="" → everything fell into the "_global" bucket,
+      breaking per-domain rate limiting entirely.
     """
 
     def __init__(
@@ -62,91 +48,71 @@ class RateLimiter:
         min_delay: float = 0.0,
         jitter: float = 0.0,
     ) -> None:
-        """
-        Args:
-            requests_per_second: Target rate. 2.0 = max 2 requests/sec per domain.
-            per_domain:          True = each domain has its own timer.
-                                 False = one global timer for all domains.
-            min_delay:           Hard minimum gap regardless of requests_per_second.
-                                 Useful when a site's robots.txt says Crawl-delay: 2.
-            jitter:              Max extra random seconds added to every delay.
-        """
-        # Convert rate to interval: 2 req/s → 0.5s between requests
-        # max(..., 0.001) prevents division by zero if someone passes 0
         self._interval = 1.0 / max(requests_per_second, 0.001)
         self._per_domain = per_domain
         self._min_delay = min_delay
         self._jitter = jitter
-
-        # Maps "domain key" → timestamp of last request to that domain
-        # "_global" is the key when per_domain=False
         self._last_request: dict[str, float] = {}
-
-        # One asyncio.Lock per domain so two coroutines hitting the same
-        # domain don't both calculate "no wait needed" simultaneously
         self._locks: dict[str, asyncio.Lock] = {}
-        self._meta_lock = asyncio.Lock()  # protects _locks dict creation
-
-        # Cumulative stats
+        self._meta_lock = asyncio.Lock()
         self._total_waits: int = 0
         self._total_wait_time: float = 0.0
 
     async def _get_lock(self, key: str) -> asyncio.Lock:
-        """Get (or create) the per-domain lock. Protected by meta_lock."""
         async with self._meta_lock:
             if key not in self._locks:
                 self._locks[key] = asyncio.Lock()
             return self._locks[key]
 
-    def _key(self, url: str) -> str:
+    def _key(self, domain: Optional[str]) -> str:
         """
-        Determine the bucket key for this URL.
-        With per_domain=True:  "example.com", "httpbin.org", etc.
-        With per_domain=False: "_global" (everything shares one timer)
+        Convert the domain argument to an internal bucket key.
+
+        Handles three input forms:
+          None                        → "_global"
+          "example.com"              → "example.com"   (plain domain, no scheme)
+          "https://example.com/path" → "example.com"   (URL, extract netloc)
+
+        The old code used urlparse(url).netloc which returns "" for plain
+        domains (no "://"), collapsing them all into "_global".
         """
-        if not self._per_domain:
+        if not self._per_domain or domain is None:
             return "_global"
-        return urlparse(url).netloc or "_global"
+        # If it looks like a full URL (has "://"), extract netloc
+        if "://" in domain:
+            netloc = urlparse(domain).netloc
+            return netloc or "_global"
+        # Plain domain string like "example.com" or "example.com:8080"
+        # Strip path/query if accidentally included
+        return domain.split("/")[0] or "_global"
 
-    async def acquire(self, url: str = "") -> float:
+    async def acquire(self, domain: Optional[str] = None) -> float:
         """
-        Wait until it is polite to make a request to this URL's domain.
-        Returns how many seconds we actually slept (0 if no wait was needed).
+        Wait until it is polite to send the next request.
 
-        Call this BEFORE every HTTP request in the crawl loop.
+        Args:
+            domain: Target domain ("example.com"), full URL, or None for global.
+                    Per Day-4 spec: acquire(self, domain: str | None).
 
-        The per-domain lock ensures that two coroutines both heading to
-        example.com don't both see "no wait needed" and fire simultaneously.
-        One of them will get the lock, sleep, update the timestamp, and release.
-        The other then gets the lock, sees the updated timestamp, and waits its turn.
+        Returns:
+            Seconds actually slept (0.0 if no wait was needed).
         """
-        key = self._key(url)
+        key = self._key(domain)
         lock = await self._get_lock(key)
 
         async with lock:
             now = time.monotonic()
             last = self._last_request.get(key, 0.0)
-
-            # How many seconds since our last request to this domain?
             elapsed_since_last = now - last
-
-            # Required minimum gap = max of rate-based interval and hard min_delay
             required_gap = max(self._interval, self._min_delay)
-
-            # How much longer do we need to wait?
             wait = max(0.0, required_gap - elapsed_since_last)
-
-            # Add random jitter on top (makes timing less predictable)
             if self._jitter > 0:
                 wait += random.uniform(0, self._jitter)
-
             if wait > 0:
                 logger.debug("Rate limit: sleeping %.2fs for %s", wait, key)
                 self._total_waits += 1
                 self._total_wait_time += wait
                 await asyncio.sleep(wait)
-
-            # Record WHEN we sent this request (after the sleep)
             self._last_request[key] = time.monotonic()
             return wait
 
@@ -166,120 +132,158 @@ class RateLimiter:
 # ===========================================================================
 class RobotsParser:
     """
-    Downloads, parses, and caches robots.txt for each domain.
+    Downloads, parses, and caches robots.txt per domain.
 
-    WHAT IS robots.txt?
-      A plain-text file at https://example.com/robots.txt that tells crawlers:
-        User-agent: *          ← rules for all bots
-        Disallow: /private/    ← don't crawl /private/ or anything under it
-        Disallow: /admin/      ← don't crawl /admin/
-        Crawl-delay: 2         ← wait 2 seconds between requests
+    FIX: API now matches Day-4 spec exactly.
 
-      Respecting robots.txt is a standard courtesy.
-      Some sites also check legally that crawlers obey it.
+    OLD (broken) API:
+        rfp = await parser.fetch_robots(session, base_url)   # external session
+        parser.can_fetch(rfp, url)                           # rfp passed manually
+        parser.get_crawl_delay(rfp)                          # rfp passed manually
 
-    WHY CACHE?
-      robots.txt is one file per domain. If we're crawling 500 pages of
-      example.com, we should fetch robots.txt ONCE and cache the result.
-      Fetching it before every single page would add 500 extra requests.
+    NEW (spec-compliant) API:
+        await parser.fetch_robots(base_url)                  # manages own session
+        parser.can_fetch(url, user_agent="*")                # no rfp needed
+        parser.get_crawl_delay(user_agent="*")               # no rfp needed
 
-    STDLIB robotparser:
-      Python's urllib.robotparser.RobotFileParser does the actual parsing
-      (handling wildcards, Allow/Disallow ordering, etc.).
-      We just need to fetch the file asynchronously and feed it the text.
+    WHY own session?
+      The spec signature fetch_robots(self, base_url: str) has no session param.
+      RobotsParser creates and owns an aiohttp.ClientSession, reusing it across
+      all fetch_robots() calls. Call close() when done to release it.
+
+    WHY store _last_domain?
+      get_crawl_delay() has no URL/domain param per spec.  It returns the delay
+      for the most-recently checked domain (i.e., the domain of the last
+      fetch_robots() or can_fetch() call).  This matches the expected usage:
+          await robots.fetch_robots(url)
+          if not robots.can_fetch(url): skip
+          delay = robots.get_crawl_delay()   # delay for url's domain
     """
 
     def __init__(self, user_agent: str = "*") -> None:
-        """
-        Args:
-            user_agent: Which User-Agent rules to check against.
-                        Use "*" to match the catch-all wildcard rules.
-                        Use "MyBot" to check rules specifically for "MyBot".
-        """
         self._user_agent = user_agent
-        # Maps "https://example.com" → RobotFileParser instance
+        # Maps "https://example.com" → RobotFileParser
         self._cache: dict[str, RobotFileParser] = {}
         self._blocked_count: int = 0
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._last_domain: Optional[str] = None   # for get_crawl_delay()
 
-    async def fetch_robots(self, session, base_url: str) -> RobotFileParser:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return the internal session, creating it lazily."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": self._user_agent},
+            )
+        return self._session
+
+    @staticmethod
+    def _extract_origin(url: str) -> str:
+        """Pull 'https://example.com' from any URL on that site."""
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    # ------------------------------------------------------------------
+    # Public API — matches Day-4 spec
+    # ------------------------------------------------------------------
+
+    async def fetch_robots(self, base_url: str) -> dict:
         """
-        Fetch and parse robots.txt for the site at base_url.
+        Fetch and cache robots.txt for the domain of base_url.
 
-        Returns a RobotFileParser object.
-        On subsequent calls for the same domain, returns the cached object
-        without making any HTTP request.
+        Per spec: fetch_robots(self, base_url: str) -> dict
+          Returns a summary dict (rules cached internally for can_fetch / get_crawl_delay).
 
-        Args:
-            session:  An open aiohttp.ClientSession to reuse for the request.
-            base_url: Any URL on the target site — we extract scheme+host from it.
+        Subsequent calls for the same domain are instant (cache hit).
+        On network failure or 404, allows everything (explicit allow-all parse).
         """
-        # Extract just "https://example.com" from "https://example.com/page?q=1"
-        parsed = urlparse(base_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
+        origin = self._extract_origin(base_url)
+        self._last_domain = origin   # remember for get_crawl_delay()
 
-        # Cache hit → return immediately, no network request
         if origin in self._cache:
-            return self._cache[origin]
+            rfp = self._cache[origin]
+            return {"domain": origin, "cached": True,
+                    "crawl_delay": rfp.crawl_delay(self._user_agent)}
 
         robots_url = urljoin(origin, "/robots.txt")
         rfp = RobotFileParser()
         rfp.set_url(robots_url)
 
+        session = await self._get_session()
         try:
-            async with session.get(robots_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(robots_url) as resp:
                 if resp.status == 200:
                     text = await resp.text()
-                    # rfp.parse() expects a list of lines, not one big string
                     rfp.parse(text.splitlines())
                     logger.info("robots.txt fetched for %s", origin)
                 else:
-                    # 404 is common — site has no robots.txt → allow everything.
-                    # We must explicitly parse an empty allow-all rule because
-                    # an un-parsed RobotFileParser blocks everything by default
-                    # (it treats the file as "unavailable" = disallow all).
+                    # 404 / other: no robots.txt → allow all
                     rfp.parse(["User-agent: *", "Allow: /"])
-                    logger.debug("No robots.txt at %s (HTTP %d), allowing all", robots_url, resp.status)
-
+                    logger.debug("No robots.txt at %s (HTTP %d), allowing all",
+                                 robots_url, resp.status)
         except Exception as exc:
-            # Network failure fetching robots.txt → allow everything
-            # Must explicitly set allow-all because un-parsed rfp blocks by default
             rfp.parse(["User-agent: *", "Allow: /"])
-            logger.warning("Could not fetch robots.txt for %s: %s (allowing all)", origin, exc)
+            logger.warning("robots.txt fetch failed for %s: %s (allowing all)", origin, exc)
 
-        # Cache even on failure so we don't retry on every subsequent page
         self._cache[origin] = rfp
-        return rfp
+        return {
+            "domain":      origin,
+            "cached":      False,
+            "crawl_delay": rfp.crawl_delay(self._user_agent),
+        }
 
-    def can_fetch(self, rfp: RobotFileParser, url: str) -> bool:
+    def can_fetch(self, url: str, user_agent: str = "*") -> bool:
         """
-        Check whether our user-agent is allowed to fetch this URL.
+        Check whether the given URL is allowed per cached robots.txt rules.
 
-        Uses Python's RobotFileParser which handles:
-          - Wildcards: "Disallow: /*.pdf$"
-          - Allow overrides: "Allow: /public/" takes priority over "Disallow: /"
-          - User-agent matching
+        Per spec: can_fetch(self, url: str, user_agent: str = "*") -> bool
 
-        Returns True (allowed) or False (blocked).
-        Blocked URLs are counted for statistics.
+        Extracts the domain from url, looks up the cached RobotFileParser.
+        Returns True (allow all) if robots.txt was never fetched for this domain.
         """
-        allowed = rfp.can_fetch(self._user_agent, url)
+        origin = self._extract_origin(url)
+        self._last_domain = origin   # keep in sync
+
+        rfp = self._cache.get(origin)
+        if rfp is None:
+            # Never fetched → default allow
+            return True
+
+        ua = user_agent if user_agent != "*" else self._user_agent
+        allowed = rfp.can_fetch(ua, url)
         if not allowed:
             self._blocked_count += 1
             logger.info("robots.txt BLOCKED: %s", url)
         return allowed
 
-    def get_crawl_delay(self, rfp: RobotFileParser) -> Optional[float]:
+    def get_crawl_delay(self, user_agent: str = "*") -> Optional[float]:
         """
-        Read the Crawl-delay directive for our user agent.
+        Return the Crawl-delay for the most recently checked domain.
 
-        Some sites specify: "Crawl-delay: 5" meaning "wait 5 seconds between requests".
-        We pass this to asyncio.sleep() in _crawl_one() to honour it.
-        Returns None if no Crawl-delay is specified.
+        Per spec: get_crawl_delay(self, user_agent: str = "*") -> float
+
+        Always call fetch_robots() or can_fetch() first so _last_domain is set.
         """
-        return rfp.crawl_delay(self._user_agent)
+        if not self._last_domain:
+            return None
+        rfp = self._cache.get(self._last_domain)
+        if rfp is None:
+            return None
+        ua = user_agent if user_agent != "*" else self._user_agent
+        return rfp.crawl_delay(ua)
 
     def get_stats(self) -> dict:
         return {
             "domains_cached": len(self._cache),
             "total_blocked":  self._blocked_count,
         }
+
+    async def close(self) -> None:
+        """Close the internal aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None

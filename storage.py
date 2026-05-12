@@ -51,7 +51,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _prepare_record(data: dict) -> dict:
+def _prepare_record_for_db(data: dict) -> dict:
     """
     Normalise a page_data dict from HTMLParser into a flat storage record.
 
@@ -61,9 +61,8 @@ def _prepare_record(data: dict) -> dict:
       We JSON-encode them into strings: ["a", "b"] → '["a", "b"]'
       This way the data can be read back and decoded from any format.
 
-    Standard schema (same across all three backends):
-      url, title, text, links_json, metadata_json,
-      crawled_at, status_code, content_type, text_length, links_count
+    DB-specific schema: links/metadata serialised to JSON strings
+    for SQLite TEXT columns. NOT used by JSONStorage or CSVStorage.
     """
     links    = data.get("links", [])
     metadata = data.get("metadata", {})
@@ -82,6 +81,20 @@ def _prepare_record(data: dict) -> dict:
         "links_count":    data.get("links_count") or len(links),
     }
 
+
+
+
+def _add_defaults(data: dict) -> dict:
+    """
+    Minimal normalisation: ensure crawled_at is set.
+    Links and metadata are kept as-is (list and dict) per Day-6 spec:
+      {"links": list[str], "metadata": dict, ...}
+    JSONStorage and CSVStorage call this; SQLiteStorage uses _prepare_record_for_db.
+    """
+    result = dict(data)
+    if not result.get("crawled_at"):
+        result["crawled_at"] = _now_iso()
+    return result
 
 # ===========================================================================
 # Abstract base class
@@ -161,8 +174,10 @@ class JSONStorage(DataStorage):
         The write is non-blocking — the event loop can run other coroutines
         while the OS flushes bytes to disk.
         """
-        record = _prepare_record(data)
-        line = json.dumps(record, ensure_ascii=False)
+        # Save original data — links stays list, metadata stays dict,
+        # matching the Day-6 standard structure exactly.
+        record = _add_defaults(data)
+        line = json.dumps(record, ensure_ascii=False, default=str)
 
         try:
             async with self._lock:  # one write at a time
@@ -207,30 +222,39 @@ class CSVStorage(DataStorage):
       The lock ensures one complete row is written before the next starts.
     """
 
-    # Only these columns are stored in CSV (text is omitted — it's too long)
-    COLUMNS = [
-        "url", "title", "text_length", "links_count",
-        "crawled_at", "status_code", "content_type",
-    ]
+    # Headers are auto-detected from the first record's keys per Day-6 spec.
+    # Complex types (lists, dicts) are JSON-serialised for CSV compatibility.
 
     def __init__(self, filepath: str) -> None:
         self._path = Path(filepath)
-        # If file exists and has content, header was already written
         self._header_written: bool = (
             self._path.exists() and self._path.stat().st_size > 0
         )
         self._saved_count: int = 0
         self._lock = asyncio.Lock()
+        # Auto-detected from first record; None until first save()
+        self._columns: list[str] = []
 
     async def save(self, data: dict) -> None:
-        record = _prepare_record(data)
-        row = [record.get(col, "") for col in self.COLUMNS]
+        record = _add_defaults(data)
+        # Serialise complex types to strings for CSV compatibility
+        flat: dict = {}
+        for k, v in record.items():
+            if isinstance(v, (list, dict)):
+                flat[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                flat[k] = v if v is not None else ""
 
-        # Build the CSV string in memory first (synchronous operation)
+        # Auto-detect columns from first record
+        if not self._columns:
+            self._columns = list(flat.keys())
+
+        row = [flat.get(col, "") for col in self._columns]
+
         buf = io.StringIO()
         writer = csv.writer(buf)
         if not self._header_written:
-            writer.writerow(self.COLUMNS)  # column names on first row
+            writer.writerow(self._columns)  # auto-detected headers
         writer.writerow(row)
         csv_text = buf.getvalue()
 
@@ -339,7 +363,7 @@ class SQLiteStorage(DataStorage):
         (which could cause duplicate writes or partial flushes).
         """
         await self._connect()
-        record = _prepare_record(data)
+        record = _prepare_record_for_db(data)
 
         async with self._lock:
             self._buffer.append(record)

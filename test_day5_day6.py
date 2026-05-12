@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 """
 async_crawler/test_day5_day6.py
 
@@ -312,5 +314,3 @@ class TestJSONStorageConcurrency:
             obj = json.loads(line)   # raises if line is corrupt
             assert "url" in obj
 
-import json
-from pathlib import Path

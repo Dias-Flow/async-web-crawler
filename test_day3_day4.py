@@ -230,6 +230,11 @@ class TestRateLimiter:
 # RobotsParser
 # ===========================================================================
 class TestRobotsParser:
+    """
+    Tests for the new RobotsParser API (no external session, no rfp).
+    RobotsParser manages its own session internally.
+    We inject a mock by setting rp._session directly before calling fetch_robots.
+    """
 
     def _make_session_mock(self, robots_text: str, status: int = 200):
         """Build a fake aiohttp session that returns robots_text."""
@@ -240,52 +245,53 @@ class TestRobotsParser:
         mock_resp.__aexit__ = AsyncMock(return_value=False)
         mock_session = MagicMock()
         mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.closed = False
         return mock_session
 
     async def test_allow_all_when_no_robots(self):
         """A 404 robots.txt should allow everything."""
         rp = RobotsParser()
-        session = self._make_session_mock("", status=404)
-        rfp = await rp.fetch_robots(session, "https://example.com")
-        assert rp.can_fetch(rfp, "https://example.com/anything") is True
+        rp._session = self._make_session_mock("", status=404)
+        await rp.fetch_robots("https://example.com")
+        assert rp.can_fetch("https://example.com/anything") is True
 
     async def test_disallow_respected(self):
         """Disallow: /private should block that path."""
         robots_txt = "User-agent: *\nDisallow: /private\n"
         rp = RobotsParser(user_agent="*")
-        session = self._make_session_mock(robots_txt)
-        rfp = await rp.fetch_robots(session, "https://example.com")
-        assert rp.can_fetch(rfp, "https://example.com/private/secret") is False
-        assert rp.can_fetch(rfp, "https://example.com/public") is True
+        rp._session = self._make_session_mock(robots_txt)
+        await rp.fetch_robots("https://example.com")
+        assert rp.can_fetch("https://example.com/private/secret") is False
+        assert rp.can_fetch("https://example.com/public") is True
 
     async def test_crawl_delay_parsed(self):
         """Crawl-delay directive should be returned by get_crawl_delay()."""
         robots_txt = "User-agent: *\nCrawl-delay: 5\n"
         rp = RobotsParser(user_agent="*")
-        session = self._make_session_mock(robots_txt)
-        rfp = await rp.fetch_robots(session, "https://example.com")
-        delay = rp.get_crawl_delay(rfp)
+        rp._session = self._make_session_mock(robots_txt)
+        await rp.fetch_robots("https://example.com")
+        delay = rp.get_crawl_delay()
         assert delay == 5.0
 
     async def test_cache_prevents_second_fetch(self):
         """Second call for same domain must not hit the network again."""
         robots_txt = "User-agent: *\nDisallow:\n"
         rp = RobotsParser()
-        session = self._make_session_mock(robots_txt)
-        await rp.fetch_robots(session, "https://example.com")
-        call_count_after_first = session.get.call_count
-        await rp.fetch_robots(session, "https://example.com/other/page")
-        # session.get should NOT have been called again
-        assert session.get.call_count == call_count_after_first
+        mock_session = self._make_session_mock(robots_txt)
+        rp._session = mock_session
+        await rp.fetch_robots("https://example.com")
+        call_count_after_first = mock_session.get.call_count
+        await rp.fetch_robots("https://example.com/other/page")
+        assert mock_session.get.call_count == call_count_after_first
 
     async def test_blocked_count_increments(self):
         """Blocked URLs should be counted in stats."""
         robots_txt = "User-agent: *\nDisallow: /\n"
         rp = RobotsParser()
-        session = self._make_session_mock(robots_txt)
-        rfp = await rp.fetch_robots(session, "https://example.com")
-        rp.can_fetch(rfp, "https://example.com/page1")
-        rp.can_fetch(rfp, "https://example.com/page2")
+        rp._session = self._make_session_mock(robots_txt)
+        await rp.fetch_robots("https://example.com")
+        rp.can_fetch("https://example.com/page1")
+        rp.can_fetch("https://example.com/page2")
         assert rp.get_stats()["total_blocked"] == 2
 
 

@@ -344,15 +344,13 @@ class AdvancedCrawler:
         try:
             # ── robots.txt ────────────────────────────────────────────
             if self._crawler._robots_parser:
-                rfp = await self._crawler._robots_parser.fetch_robots(
-                    self._crawler._session, url)
-                if not self._crawler._robots_parser.can_fetch(rfp, url):
+                await self._crawler._robots_parser.fetch_robots(url)
+                if not self._crawler._robots_parser.can_fetch(url):
                     logger.info("robots.txt SKIP: %s", url)
                     self._crawler._queue.mark_failed(url, "blocked by robots.txt")
-                    # Fix: also record in failed_urls so CrawlerStats counts it
                     self._crawler.failed_urls[url] = "blocked by robots.txt"
                     return
-                crawl_delay = self._crawler._robots_parser.get_crawl_delay(rfp)
+                crawl_delay = self._crawler._robots_parser.get_crawl_delay()
                 if crawl_delay:
                     await asyncio.sleep(crawl_delay)
 
