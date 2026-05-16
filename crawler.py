@@ -225,13 +225,16 @@ class AsyncCrawler:
         Used by the normal retry loop inside fetch_url / fetch_urls.
         """
         logger.info("-> Fetching %s (attempt %d)", url, attempt)
-        # Apply politeness before every request (rate limit + robots)
+        # Apply politeness before every request (rate limit + robots + Crawl-delay)
         await self._rate_limiter.acquire(url)
         if self._robots_parser:
             await self._robots_parser.fetch_robots(url)
             if not self._robots_parser.can_fetch(url):
                 from retry_strategy import PermanentError
                 raise PermanentError(f"robots.txt disallows: {url}")
+            crawl_delay = self._robots_parser.get_crawl_delay()
+            if crawl_delay:
+                await asyncio.sleep(crawl_delay)
         t0 = time.perf_counter()
         try:
             async with self._session.get(url, allow_redirects=True) as resp:
@@ -279,13 +282,17 @@ class AsyncCrawler:
           Used exclusively by AdvancedCrawler._crawl_one_with_retry().
         """
         logger.info("-> Fetching (raising) %s", url)
-        # Apply rate limiting and robots check before the request
+        # Apply rate limiting, robots check, and Crawl-delay
         await self._rate_limiter.acquire(url)
         if self._robots_parser:
             await self._robots_parser.fetch_robots(url)
             if not self._robots_parser.can_fetch(url):
                 from retry_strategy import PermanentError
                 raise PermanentError(f"robots.txt disallows: {url}")
+            # Honour Crawl-delay from robots.txt (Day-4 requirement)
+            crawl_delay = self._robots_parser.get_crawl_delay()
+            if crawl_delay:
+                await asyncio.sleep(crawl_delay)
         t0 = time.perf_counter()  # start timing AFTER politeness checks
         async with self._session.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
@@ -381,8 +388,14 @@ class AsyncCrawler:
         """
         self._active_tasks += 1
         try:
-            # Rate limiting applied inside _do_fetch via _apply_politeness().
-            # Here we only honour Crawl-delay AFTER robots check.
+            # Rate limiting and robots.txt are applied inside _do_fetch_raising()
+            # which is called by fetch_and_parse() → _fetch_url_internal().
+            # We must NOT repeat them here to avoid double-waiting.
+            #
+            # The only thing we do here is pre-check robots so we can skip
+            # the URL immediately without fetching it at all.
+            # NOTE: fetch_robots() is cached so the second call inside
+            # _do_fetch_raising is instant (no network).
             if self._robots_parser:
                 await self._robots_parser.fetch_robots(url)
                 if not self._robots_parser.can_fetch(url):
@@ -390,11 +403,6 @@ class AsyncCrawler:
                     self._queue.mark_processed(url, error="blocked by robots.txt")
                     self.failed_urls[url] = "blocked by robots.txt"
                     return
-                crawl_delay = self._robots_parser.get_crawl_delay()
-                if crawl_delay:
-                    await asyncio.sleep(crawl_delay)
-
-            await self._rate_limiter.acquire(url)
 
             ctx = await self._sem_manager.domain_context(url)
             async with ctx:
@@ -537,3 +545,9 @@ class AsyncCrawler:
 
     async def __aexit__(self, *_) -> None:
         await self.close()
+
+
+# ---------------------------------------------------------------------------
+# Day-7 re-export: per spec example 'from crawler import AdvancedCrawler'
+# ---------------------------------------------------------------------------
+from advanced_crawler import AdvancedCrawler  # noqa: F401

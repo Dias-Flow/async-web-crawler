@@ -533,6 +533,10 @@ class AdvancedCrawler:
         )
         logger.info("Stats written to %s", output_path)
 
+    def export_to_json(self, filename: str) -> None:
+        """Alias per Day-7 spec: export_to_json(self, filename: str)."""
+        self.export_stats_to_json(filename)
+
     async def close(self) -> None:
         await self._crawler.close()
         if self._storage:
