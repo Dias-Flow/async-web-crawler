@@ -225,6 +225,13 @@ class AsyncCrawler:
         Used by the normal retry loop inside fetch_url / fetch_urls.
         """
         logger.info("-> Fetching %s (attempt %d)", url, attempt)
+        # Apply politeness before every request (rate limit + robots)
+        await self._rate_limiter.acquire(url)
+        if self._robots_parser:
+            await self._robots_parser.fetch_robots(url)
+            if not self._robots_parser.can_fetch(url):
+                from retry_strategy import PermanentError
+                raise PermanentError(f"robots.txt disallows: {url}")
         t0 = time.perf_counter()
         try:
             async with self._session.get(url, allow_redirects=True) as resp:
@@ -272,16 +279,26 @@ class AsyncCrawler:
           Used exclusively by AdvancedCrawler._crawl_one_with_retry().
         """
         logger.info("-> Fetching (raising) %s", url)
+        # Apply rate limiting and robots check before the request
+        await self._rate_limiter.acquire(url)
+        if self._robots_parser:
+            await self._robots_parser.fetch_robots(url)
+            if not self._robots_parser.can_fetch(url):
+                from retry_strategy import PermanentError
+                raise PermanentError(f"robots.txt disallows: {url}")
+        t0 = time.perf_counter()  # start timing AFTER politeness checks
         async with self._session.get(url, allow_redirects=True) as resp:
             resp.raise_for_status()
             content = await resp.text()
+            elapsed = time.perf_counter() - t0
             ct_header = resp.headers.get("Content-Type", "text/html")
-            # headers.get can return a coroutine in tests — guard against it
             if not isinstance(ct_header, str):
                 ct_header = "text/html"
             ct = ct_header.split(";")[0].strip()
+            logger.info("OK %s - HTTP %d | %.1f KB | %.2fs",
+                        url, resp.status, len(content) / 1024, elapsed)
             return FetchResult(url=url, status=resp.status, content=content,
-                               content_type=ct, elapsed=0.0)
+                               content_type=ct, elapsed=elapsed)
 
     # ================================================================== #
     #  Day 2 - fetch + parse                                              #
@@ -403,7 +420,7 @@ class AsyncCrawler:
                 for link in page.get("links", []):
                     if self._should_crawl(link, seed_domain, same_domain_only,
                                           exclude_patterns, include_patterns):
-                        await self._queue.add_url(link, depth=depth + 1)
+                        self._queue.add_url(link, depth=depth + 1)
 
         finally:
             self._active_tasks -= 1
@@ -425,7 +442,7 @@ class AsyncCrawler:
         self._init_crawl_components()
 
         for url in start_urls:
-            await self._queue.add_url(url, depth=0)
+            self._queue.add_url(url, depth=0)
 
         t0 = time.perf_counter()
         last_log = t0

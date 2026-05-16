@@ -41,20 +41,25 @@ class CrawlerQueue:
         self._counter: int = 0
         self._lock = asyncio.Lock()
 
-    async def add_url(self, url: str, priority: int = 0, depth: int = 0) -> bool:
+    def add_url(self, url: str, priority: int = 0, depth: int = 0) -> bool:
         """
         Enqueue a URL. Returns True if new, False if already known.
-        Depth is stored in URLRecord and retrievable via get_depth().
+        Per Day-3 spec: synchronous method (no async).
+
+        WHY sync is safe here:
+          asyncio is single-threaded. A synchronous method runs atomically
+          within one event-loop tick — no other coroutine can preempt it,
+          so no Lock is needed. put_nowait() is used instead of await put()
+          because the queue is unbounded and never blocks.
         """
-        async with self._lock:
-            if url in self._index:
-                return False
-            record = URLRecord(url=url, priority=priority, depth=depth)
-            self._index[url] = record
-            self._counter += 1
-            await self._queue.put((priority, self._counter, url, depth))
-            logger.debug("Queued [depth=%d pri=%d] %s", depth, priority, url)
-            return True
+        if url in self._index:
+            return False
+        record = URLRecord(url=url, priority=priority, depth=depth)
+        self._index[url] = record
+        self._counter += 1
+        self._queue.put_nowait((priority, self._counter, url, depth))
+        logger.debug("Queued [depth=%d pri=%d] %s", depth, priority, url)
+        return True
 
     async def get_next(self) -> Optional[str]:
         """

@@ -401,6 +401,12 @@ class AdvancedCrawler:
             page["content_type"]  = fetch_result.content_type or "text/html"
             page["crawled_at"]    = datetime.now(timezone.utc).isoformat()
 
+            # -- check parse errors -------------------------------------------
+            if page.get("error"):
+                self._crawler._queue.mark_processed(url, error=page["error"])
+                self._crawler.failed_urls[url] = page["error"]
+                return
+
             # ── save result ───────────────────────────────────────────
             self._crawler._queue.mark_visited(url)
             self._crawler.visited_urls.add(url)
@@ -420,7 +426,7 @@ class AdvancedCrawler:
                         link, seed_domain, same_domain_only,
                         exclude_patterns, include_patterns,
                     ):
-                        await self._crawler._queue.add_url(link, depth=depth + 1)
+                        self._crawler._queue.add_url(link, depth=depth + 1)
 
         finally:
             self._crawler._active_tasks -= 1
@@ -452,7 +458,7 @@ class AdvancedCrawler:
 
         seed_domain = _up(self.start_urls[0]).netloc if self.start_urls else ""
         for url in self.start_urls:
-            await self._crawler._queue.add_url(url, depth=0)
+            self._crawler._queue.add_url(url, depth=0)
 
         t0 = time.perf_counter()
         last_log = t0

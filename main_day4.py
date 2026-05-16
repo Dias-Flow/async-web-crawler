@@ -36,22 +36,22 @@ async def demo_robots_parser() -> None:
     specific paths are allowed.
     """
     print("\n── Robots.txt Demo ────────────────────────────────")
-    async with aiohttp.ClientSession() as session:
-        rp = RobotsParser(user_agent="*")
+    rp = RobotsParser(user_agent="*")  # manages own session internally
 
-        tests = [
-            ("https://example.com", "https://example.com/"),
-            ("https://httpbin.org", "https://httpbin.org/get"),
-            ("https://httpbin.org", "https://httpbin.org/anything"),
-        ]
+    tests = [
+        ("https://example.com", "https://example.com/"),
+        ("https://httpbin.org", "https://httpbin.org/get"),
+        ("https://httpbin.org", "https://httpbin.org/anything"),
+    ]
 
-        for base, check_url in tests:
-            rfp = await rp.fetch_robots(session, base)
-            allowed = rp.can_fetch(rfp, check_url)
-            delay = rp.get_crawl_delay(rfp)
-            status = "✓ ALLOWED" if allowed else "✗ BLOCKED"
-            print(f"  {status:12}  {check_url}  (crawl-delay={delay})")
+    for base, check_url in tests:
+        await rp.fetch_robots(base)           # new API: no session arg
+        allowed = rp.can_fetch(check_url)     # new API: no rfp arg
+        delay = rp.get_crawl_delay()          # new API: no rfp arg
+        status = "✓ ALLOWED" if allowed else "✗ BLOCKED"
+        print(f"  {status:12}  {check_url}  (crawl-delay={delay})")
 
+    await rp.close()
     print("\nRobots parser stats:", rp.get_stats())
 
 

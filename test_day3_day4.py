@@ -27,27 +27,27 @@ class TestCrawlerQueue:
     async def test_add_new_url_returns_true(self):
         """First add of a URL should succeed."""
         q = CrawlerQueue()
-        added = await q.add_url("https://example.com")
+        added = q.add_url("https://example.com")
         assert added is True
 
     async def test_add_duplicate_returns_false(self):
         """Adding the same URL twice should return False the second time."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com")
-        added_again = await q.add_url("https://example.com")
+        q.add_url("https://example.com")
+        added_again = q.add_url("https://example.com")
         assert added_again is False
 
     async def test_get_next_returns_url(self):
         """get_next() returns str|None per Day-3 spec."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com", depth=2)
+        q.add_url("https://example.com", depth=2)
         url = await q.get_next()
         assert url == "https://example.com"
 
     async def test_get_depth_returns_correct_depth(self):
         """get_depth() returns the depth stored when the URL was added."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com", depth=2)
+        q.add_url("https://example.com", depth=2)
         await q.get_next()
         assert q.get_depth("https://example.com") == 2
 
@@ -60,15 +60,15 @@ class TestCrawlerQueue:
     async def test_priority_order(self):
         """Lower priority number should come out first."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com/low", priority=10)
-        await q.add_url("https://example.com/high", priority=1)
+        q.add_url("https://example.com/low", priority=10)
+        q.add_url("https://example.com/high", priority=1)
         first = await q.get_next()
         assert first == "https://example.com/high"
 
     async def test_mark_processed_updates_state(self):
         """After mark_processed the URL should appear in visited stats."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com")
+        q.add_url("https://example.com")
         await q.get_next()
         q.mark_processed("https://example.com")
         stats = q.get_stats()
@@ -77,7 +77,7 @@ class TestCrawlerQueue:
     async def test_mark_failed_updates_state(self):
         """After mark_failed the URL should appear in failed stats."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com")
+        q.add_url("https://example.com")
         await q.get_next()
         q.mark_failed("https://example.com", "timeout")
         stats = q.get_stats()
@@ -87,25 +87,26 @@ class TestCrawlerQueue:
         """get_stats total_seen should equal number of unique adds."""
         q = CrawlerQueue()
         for i in range(5):
-            await q.add_url(f"https://example.com/{i}")
+            q.add_url(f"https://example.com/{i}")
         stats = q.get_stats()
         assert stats["total_seen"] == 5
 
     async def test_is_known_after_add(self):
         """is_known() must be True right after adding a URL."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com/page")
+        q.add_url("https://example.com/page")
         assert q.is_known("https://example.com/page") is True
 
     async def test_is_known_false_for_unseen(self):
         q = CrawlerQueue()
         assert q.is_known("https://never-added.com") is False
 
-    async def test_no_duplicates_under_concurrency(self):
-        """Concurrent adds of the same URL should result in exactly one entry."""
+    def test_no_duplicates_under_concurrency(self):
+        """add_url is now sync: calling it 20 times returns True only once."""
         q = CrawlerQueue()
         url = "https://example.com/concurrent"
-        results = await asyncio.gather(*[q.add_url(url) for _ in range(20)])
+        # add_url is synchronous — call directly, no gather needed
+        results = [q.add_url(url) for _ in range(20)]
         assert sum(results) == 1        # only one True
         assert q.get_stats()["total_seen"] == 1
 
@@ -318,7 +319,7 @@ class TestRobotsBlockInFailedUrls:
     async def test_mark_failed_stores_error(self):
         """mark_failed should store the error message in URLRecord."""
         q = CrawlerQueue()
-        await q.add_url("https://example.com/private")
+        q.add_url("https://example.com/private")
         await q.get_next()
         q.mark_failed("https://example.com/private", "blocked by robots.txt")
         failed = q.get_failed()
