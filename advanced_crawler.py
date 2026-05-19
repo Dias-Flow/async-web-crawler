@@ -342,7 +342,11 @@ class AdvancedCrawler:
 
         self._crawler._active_tasks += 1
         try:
-            # ── robots.txt ────────────────────────────────────────────
+            # ── robots.txt pre-check (skip before fetch, cached so free) ──
+            # Rate limiting, Crawl-delay, and robots enforcement are applied
+            # inside _do_fetch_raising(). We only do a quick pre-check here
+            # so we can mark the URL as failed BEFORE spending a retry slot.
+            # fetch_robots() is cached per domain — no extra network request.
             if self._crawler._robots_parser:
                 await self._crawler._robots_parser.fetch_robots(url)
                 if not self._crawler._robots_parser.can_fetch(url):
@@ -350,12 +354,6 @@ class AdvancedCrawler:
                     self._crawler._queue.mark_failed(url, "blocked by robots.txt")
                     self._crawler.failed_urls[url] = "blocked by robots.txt"
                     return
-                crawl_delay = self._crawler._robots_parser.get_crawl_delay()
-                if crawl_delay:
-                    await asyncio.sleep(crawl_delay)
-
-            # ── rate limiter ──────────────────────────────────────────
-            await self._crawler._rate_limiter.acquire(url)
 
             # ── domain semaphore ──────────────────────────────────────
             ctx = await self._crawler._sem_manager.domain_context(url)
@@ -464,8 +462,18 @@ class AdvancedCrawler:
         last_log = t0
 
         while True:
-            if len(self._crawler.visited_urls) >= self.max_pages:
-                logger.info("Reached max_pages=%d, stopping.", self.max_pages)
+            slots_used = (
+                len(self._crawler.visited_urls) + self._crawler._active_tasks
+            )
+            if slots_used >= self.max_pages:
+                logger.info(
+                    "Reached max_pages=%d (visited=%d in-flight=%d), stopping.",
+                    self.max_pages,
+                    len(self._crawler.visited_urls),
+                    self._crawler._active_tasks,
+                )
+                for t in list(self._crawler._crawl_tasks):
+                    t.cancel()
                 break
 
             url = await self._crawler._queue.get_next()

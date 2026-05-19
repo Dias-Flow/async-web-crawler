@@ -458,8 +458,19 @@ class AsyncCrawler:
                     seed_domain, max_pages, self.max_depth)
 
         while True:
-            if len(self.visited_urls) >= max_pages:
-                logger.info("Reached max_pages=%d, stopping.", max_pages)
+            # Hard limit: count visited AND in-flight together.
+            # Without counting active_tasks, we can launch 50 tasks
+            # before any of them increments visited_urls, then all 50
+            # complete and blow past max_pages.
+            slots_used = len(self.visited_urls) + self._active_tasks
+            if slots_used >= max_pages:
+                logger.info(
+                    "Reached max_pages=%d (visited=%d in-flight=%d), stopping.",
+                    max_pages, len(self.visited_urls), self._active_tasks,
+                )
+                # Cancel tasks that are still pending (haven't started HTTP)
+                for t in list(self._crawl_tasks):
+                    t.cancel()
                 break
 
             url = await self._queue.get_next()  # str|None per Day-3 spec
@@ -483,7 +494,6 @@ class AsyncCrawler:
                                 same_domain_only, exclude_patterns, include_patterns)
             )
             self._crawl_tasks.add(task)
-            # discard() removes the task from the set when it finishes
             task.add_done_callback(self._crawl_tasks.discard)
 
             now = time.perf_counter()
