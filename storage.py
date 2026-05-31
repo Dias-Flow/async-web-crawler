@@ -355,6 +355,10 @@ class SQLiteStorage(DataStorage):
             await self._db.commit()
             logger.info("SQLiteStorage connected — %s", self._db_path)
 
+    async def init_db(self) -> None:
+        """Public Day-6 API: create/open the SQLite database and tables."""
+        await self._connect()
+
     async def save(self, data: dict) -> None:
         """
         Buffer one record. Flush to DB when buffer reaches batch_size.

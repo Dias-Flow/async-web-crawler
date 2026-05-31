@@ -26,24 +26,24 @@ LISTING_HTML = """
   <div class="page_inner">
     <article class="product_pod">
       <div class="image_container">
-        <a href="../a-light-in-the-attic_1000/index.html">
+        <a href="a-light-in-the-attic_1000/index.html">
           <img src="..." alt="A Light in the Attic">
         </a>
       </div>
       <p class="star-rating Three"></p>
-      <h3><a href="../a-light-in-the-attic_1000/index.html" title="A Light in the Attic">A Light ...</a></h3>
+      <h3><a href="a-light-in-the-attic_1000/index.html" title="A Light in the Attic">A Light ...</a></h3>
       <p class="price_color">£51.77</p>
       <p class="instock availability">In stock</p>
     </article>
 
     <article class="product_pod">
       <div class="image_container">
-        <a href="../tipping-the-velvet_999/index.html">
+        <a href="tipping-the-velvet_999/index.html">
           <img src="..." alt="Tipping the Velvet">
         </a>
       </div>
       <p class="star-rating One"></p>
-      <h3><a href="../tipping-the-velvet_999/index.html" title="Tipping the Velvet">Tipping ...</a></h3>
+      <h3><a href="tipping-the-velvet_999/index.html" title="Tipping the Velvet">Tipping ...</a></h3>
       <p class="price_color">£53.74</p>
     </article>
   </div>
@@ -130,7 +130,7 @@ class TestBooksListingParser:
         """Check that relative href is correctly resolved against the listing URL."""
         parser = BooksListingParser()
         urls = parser.parse(LISTING_HTML, LISTING_URL)
-        # "../a-light-in-the-attic_1000/index.html" relative to
+        # "a-light-in-the-attic_1000/index.html" relative to
         # "http://books.toscrape.com/catalogue/page-1.html"
         # should become:
         assert "http://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html" in urls

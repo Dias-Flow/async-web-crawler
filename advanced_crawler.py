@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -228,21 +229,10 @@ class AdvancedCrawler:
     """
     Final integration crawler (Day 7).
 
-    FIX: RetryStrategy is now wired in properly.
-
-    HOW RetryStrategy is integrated:
-      AdvancedCrawler does NOT subclass AsyncCrawler.
-      Instead it owns an AsyncCrawler instance and replaces the fetch step
-      in its own _crawl_one_with_retry() coroutine:
-
-        async def _crawl_one_with_retry(url):
-            # Wrap the raw HTTP fetch in RetryStrategy
-            result = await self._retry.execute_with_retry(
-                self._crawler._fetch_url_internal, url, url=url
-            )
-
-      This gives us exponential back-off (Day 5) on every real crawl.
-      AsyncCrawler keeps max_retries=0 so there's no double-retry.
+    It owns an AsyncCrawler instance and uses its HTTP, parsing, queue,
+    semaphore, rate limiting, robots.txt, and storage integrations. The fetch
+    step in this class is explicitly wrapped in RetryStrategy so Day-5
+    exponential backoff is active in the final crawler.
     """
 
     def __init__(
@@ -275,7 +265,12 @@ class AdvancedCrawler:
         self._storage         = storage
 
         if log_file:
-            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh = RotatingFileHandler(
+                log_file,
+                maxBytes=5_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
             fh.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
             logging.getLogger().addHandler(fh)
@@ -284,11 +279,12 @@ class AdvancedCrawler:
         from retry_strategy import RetryStrategy, TransientError, NetworkError
 
         # AsyncCrawler with max_retries=0 — ALL retries handled by RetryStrategy
+        # in this final integration layer, avoiding double retries.
         self._crawler = AsyncCrawler(
             max_concurrent=max_concurrent,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
-            max_retries=0,          # ← important: RetryStrategy is the retry layer
+            max_retries=0,
             max_depth=max_depth,
             requests_per_second=requests_per_second,
             min_delay=min_delay,
@@ -297,7 +293,6 @@ class AdvancedCrawler:
             user_agent=user_agent,
         )
 
-        # FIX: RetryStrategy is now actually called in _crawl_one_with_retry()
         self._retry = RetryStrategy(
             max_retries=max_retries,
             backoff_base=1.0,
@@ -309,9 +304,6 @@ class AdvancedCrawler:
         self.stats = CrawlerStats()
         self.results: dict[str, dict] = {}
 
-    # ------------------------------------------------------------------
-    # FIX: _crawl_one_with_retry — the actual integration point
-    # ------------------------------------------------------------------
     async def _crawl_one_with_retry(
         self,
         url: str,
@@ -322,31 +314,19 @@ class AdvancedCrawler:
         include_patterns: list[str],
     ) -> None:
         """
-        Worker coroutine that wraps the HTTP fetch with RetryStrategy.
+        Worker coroutine that wraps the raw HTTP fetch with RetryStrategy.
 
-        WHAT THIS REPLACES:
-          AsyncCrawler._crawl_one() calls fetch_and_parse() directly.
-          This version calls _fetch_url_internal() through execute_with_retry()
-          so exponential back-off kicks in on timeouts and 503 errors.
-
-        FLOW:
-          1. robots.txt check (same as AsyncCrawler)
-          2. rate limiter (same as AsyncCrawler)
-          3. domain semaphore (same as AsyncCrawler)
-          4. RetryStrategy.execute_with_retry(_fetch_url_internal)  ← THE FIX
-          5. parse HTML from the FetchResult
-          6. save result, mark visited, enqueue links (same as AsyncCrawler)
+        AdvancedCrawler.crawl() increments self._crawler._active_tasks before
+        scheduling this coroutine. This avoids an early-exit race where the
+        controller sees zero active tasks before a newly created coroutine has
+        actually started.
         """
         from parser import _empty_page_data
         from retry_strategy import CrawlerError
 
-        self._crawler._active_tasks += 1
         try:
-            # ── robots.txt pre-check (skip before fetch, cached so free) ──
-            # Rate limiting, Crawl-delay, and robots enforcement are applied
-            # inside _do_fetch_raising(). We only do a quick pre-check here
-            # so we can mark the URL as failed BEFORE spending a retry slot.
-            # fetch_robots() is cached per domain — no extra network request.
+            # Cached robots pre-check. _do_fetch_raising() also enforces robots,
+            # rate limiting, and Crawl-delay before the actual HTTP request.
             if self._crawler._robots_parser:
                 await self._crawler._robots_parser.fetch_robots(url)
                 if not self._crawler._robots_parser.can_fetch(url):
@@ -355,25 +335,15 @@ class AdvancedCrawler:
                     self._crawler.failed_urls[url] = "blocked by robots.txt"
                     return
 
-            # ── domain semaphore ──────────────────────────────────────
             ctx = await self._crawler._sem_manager.domain_context(url)
             async with ctx:
-                # FIX: wrap the raw fetch with RetryStrategy
-                # execute_with_retry calls _fetch_url_internal and retries on
-                # TransientError / NetworkError with exponential back-off.
                 try:
                     fetch_result = await self._retry.execute_with_retry(
                         self._crawler._do_fetch_raising,
                         url,
                         url=url,
-                        # _do_fetch_raising RAISES on error (unlike _do_fetch which
-                        # swallows exceptions into FetchResult.error).
-                        # This allows RetryStrategy to catch the exception,
-                        # classify it (Transient/Network/Permanent), and apply
-                        # exponential back-off before retrying.
                     )
                 except CrawlerError as exc:
-                    # All retries exhausted — treat as fetch failure
                     page = _empty_page_data(url)
                     page["error"] = str(exc)
                     page["crawled_at"] = datetime.now(timezone.utc).isoformat()
@@ -381,7 +351,6 @@ class AdvancedCrawler:
                     self._crawler.failed_urls[url] = str(exc)
                     return
 
-            # ── parse HTML ────────────────────────────────────────────
             if not fetch_result.success:
                 page = _empty_page_data(url)
                 page["error"]        = fetch_result.error or f"HTTP {fetch_result.status}"
@@ -399,13 +368,11 @@ class AdvancedCrawler:
             page["content_type"]  = fetch_result.content_type or "text/html"
             page["crawled_at"]    = datetime.now(timezone.utc).isoformat()
 
-            # -- check parse errors -------------------------------------------
             if page.get("error"):
                 self._crawler._queue.mark_processed(url, error=page["error"])
                 self._crawler.failed_urls[url] = page["error"]
                 return
 
-            # ── save result ───────────────────────────────────────────
             self._crawler._queue.mark_visited(url)
             self._crawler.visited_urls.add(url)
             self._crawler.processed_urls[url] = page
@@ -416,9 +383,7 @@ class AdvancedCrawler:
                 except Exception as exc:
                     logger.error("Storage save failed for %s: %s", url, exc)
 
-            # ── enqueue links ─────────────────────────────────────────
             if depth < self._crawler.max_depth:
-                import re
                 for link in page.get("links", []):
                     if self._crawler._should_crawl(
                         link, seed_domain, same_domain_only,
@@ -426,6 +391,16 @@ class AdvancedCrawler:
                     ):
                         self._crawler._queue.add_url(link, depth=depth + 1)
 
+        except asyncio.CancelledError:
+            if self._crawler._queue:
+                self._crawler._queue.mark_failed(url, "cancelled")
+                self._crawler.failed_urls[url] = "cancelled"
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected AdvancedCrawler worker error for %s: %s", url, exc)
+            if self._crawler._queue:
+                self._crawler._queue.mark_failed(url, str(exc))
+            self._crawler.failed_urls[url] = str(exc)
         finally:
             self._crawler._active_tasks -= 1
             if (self._crawler._active_tasks == 0
@@ -433,13 +408,15 @@ class AdvancedCrawler:
                     and self._crawler._all_done_event):
                 self._crawler._all_done_event.set()
 
-    # ------------------------------------------------------------------
     async def crawl(self) -> dict[str, dict]:
         """
-        Run the full crawl using _crawl_one_with_retry workers.
-        Mirrors AsyncCrawler.crawl() but dispatches our retry-aware worker.
+        Run the full crawl using retry-aware workers.
+
+        Uses a strict scheduled_count limit: at most self.max_pages URLs are
+        scheduled. Active task accounting is incremented before create_task(),
+        so the controller cannot exit early while a newly created task has not
+        started yet.
         """
-        import re
         from urllib.parse import urlparse as _up
 
         logger.info("AdvancedCrawler starting — %d seed URLs", len(self.start_urls))
@@ -451,7 +428,6 @@ class AdvancedCrawler:
                 logger.info("Sitemap discovered %d additional URLs", len(extra))
                 self.start_urls = list(dict.fromkeys(self.start_urls + extra))
 
-        # Initialise queue, semaphores, rate limiter, robots parser
         self._crawler._init_crawl_components()
 
         seed_domain = _up(self.start_urls[0]).netloc if self.start_urls else ""
@@ -460,20 +436,11 @@ class AdvancedCrawler:
 
         t0 = time.perf_counter()
         last_log = t0
+        scheduled_count = 0
 
         while True:
-            slots_used = (
-                len(self._crawler.visited_urls) + self._crawler._active_tasks
-            )
-            if slots_used >= self.max_pages:
-                logger.info(
-                    "Reached max_pages=%d (visited=%d in-flight=%d), stopping.",
-                    self.max_pages,
-                    len(self._crawler.visited_urls),
-                    self._crawler._active_tasks,
-                )
-                for t in list(self._crawler._crawl_tasks):
-                    t.cancel()
+            if scheduled_count >= self.max_pages:
+                logger.info("Reached max_pages=%d; waiting for in-flight tasks.", self.max_pages)
                 break
 
             url = await self._crawler._queue.get_next()
@@ -484,14 +451,17 @@ class AdvancedCrawler:
                 try:
                     await asyncio.wait_for(
                         self._crawler._all_done_event.wait(), timeout=0.2)
-                    break
                 except asyncio.TimeoutError:
+                    pass
+                finally:
                     self._crawler._all_done_event.clear()
-                    continue
+                continue
 
             self._crawler._all_done_event.clear()
             depth = self._crawler._queue.get_depth(url)
 
+            self._crawler._active_tasks += 1
+            scheduled_count += 1
             task = asyncio.create_task(
                 self._crawl_one_with_retry(
                     url, depth, seed_domain,
@@ -509,18 +479,19 @@ class AdvancedCrawler:
                 elapsed = now - t0
                 speed = len(self._crawler.visited_urls) / elapsed if elapsed else 0
                 logger.info(
-                    "Progress — visited=%d | queued=%d | active=%d | %.1f p/s",
+                    "Progress — visited=%d | queued=%d | active=%d | scheduled=%d | %.1f p/s",
                     stats["visited"], stats["pending"],
-                    self._crawler._active_tasks, speed,
+                    self._crawler._active_tasks, scheduled_count, speed,
                 )
                 last_log = now
 
-        # Await any tasks that were still running when the loop exited
         if self._crawler._crawl_tasks:
             await asyncio.gather(*list(self._crawler._crawl_tasks), return_exceptions=True)
 
         self.results = self._crawler.processed_urls
 
+        # Rebuild stats from the crawl state so repeated calls don't double-count.
+        self.stats = CrawlerStats()
         for url, page in self.results.items():
             self.stats.record_page(page)
         for url, error in self._crawler.failed_urls.items():

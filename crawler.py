@@ -384,18 +384,16 @@ class AsyncCrawler:
                          include_patterns: list) -> None:
         """
         Worker coroutine for one URL.
-        Day 6: calls self.storage.save(page) after each successful page.
+
+        Important: crawl() increments self._active_tasks immediately before
+        scheduling this coroutine. This avoids a race where the main crawl loop
+        could see zero active tasks before a newly created task has actually
+        started. This method only decrements the counter in finally.
         """
-        self._active_tasks += 1
         try:
             # Rate limiting and robots.txt are applied inside _do_fetch_raising()
-            # which is called by fetch_and_parse() → _fetch_url_internal().
-            # We must NOT repeat them here to avoid double-waiting.
-            #
-            # The only thing we do here is pre-check robots so we can skip
-            # the URL immediately without fetching it at all.
-            # NOTE: fetch_robots() is cached so the second call inside
-            # _do_fetch_raising is instant (no network).
+            # via fetch_and_parse(). We only do a cached pre-check here so a
+            # disallowed URL is recorded without spending a retry slot.
             if self._robots_parser:
                 await self._robots_parser.fetch_robots(url)
                 if not self._robots_parser.can_fetch(url):
@@ -430,9 +428,20 @@ class AsyncCrawler:
                                           exclude_patterns, include_patterns):
                         self._queue.add_url(link, depth=depth + 1)
 
+        except asyncio.CancelledError:
+            # If the crawl is cancelled from outside, keep queue bookkeeping sane.
+            if self._queue:
+                self._queue.mark_processed(url, error="cancelled")
+                self.failed_urls[url] = "cancelled"
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected crawl worker error for %s: %s", url, exc)
+            if self._queue:
+                self._queue.mark_processed(url, error=str(exc))
+            self.failed_urls[url] = str(exc)
         finally:
             self._active_tasks -= 1
-            if self._active_tasks == 0 and self._queue.pending_count() == 0:
+            if self._all_done_event and self._active_tasks == 0 and self._queue.pending_count() == 0:
                 self._all_done_event.set()
 
     async def crawl(
@@ -443,6 +452,15 @@ class AsyncCrawler:
         exclude_patterns: Optional[list[str]] = None,
         include_patterns: Optional[list[str]] = None,
     ) -> dict[str, dict]:
+        """
+        Crawl pages from start_urls with a strict max_pages scheduling limit.
+
+        The previous implementation counted only visited + active tasks. Because
+        active_tasks was incremented inside worker coroutines, the controller
+        could exit too early or overschedule pages. This version increments
+        active_tasks before create_task() and uses scheduled_count as the hard
+        limit: no more than max_pages URLs are ever scheduled.
+        """
         exclude_patterns = exclude_patterns or []
         include_patterns = include_patterns or []
         seed_domain = urlparse(start_urls[0]).netloc if start_urls else ""
@@ -454,23 +472,14 @@ class AsyncCrawler:
 
         t0 = time.perf_counter()
         last_log = t0
+        scheduled_count = 0
         logger.info("Crawl started - seed=%s, max_pages=%d, max_depth=%d",
                     seed_domain, max_pages, self.max_depth)
 
         while True:
-            # Hard limit: count visited AND in-flight together.
-            # Without counting active_tasks, we can launch 50 tasks
-            # before any of them increments visited_urls, then all 50
-            # complete and blow past max_pages.
-            slots_used = len(self.visited_urls) + self._active_tasks
-            if slots_used >= max_pages:
-                logger.info(
-                    "Reached max_pages=%d (visited=%d in-flight=%d), stopping.",
-                    max_pages, len(self.visited_urls), self._active_tasks,
-                )
-                # Cancel tasks that are still pending (haven't started HTTP)
-                for t in list(self._crawl_tasks):
-                    t.cancel()
+            # Stop taking new URLs once the strict scheduling budget is used.
+            if scheduled_count >= max_pages:
+                logger.info("Reached max_pages=%d; waiting for in-flight tasks.", max_pages)
                 break
 
             url = await self._queue.get_next()  # str|None per Day-3 spec
@@ -479,16 +488,21 @@ class AsyncCrawler:
                 if self._active_tasks == 0:
                     break
                 try:
-                    await asyncio.wait_for(
-                        self._all_done_event.wait(), timeout=0.2)
-                    break
+                    await asyncio.wait_for(self._all_done_event.wait(), timeout=0.2)
                 except asyncio.TimeoutError:
+                    pass
+                finally:
                     self._all_done_event.clear()
-                    continue
+                continue
 
-            self._all_done_event.clear()
             depth = self._queue.get_depth(url)
+            self._all_done_event.clear()
 
+            # Count the task BEFORE scheduling it. This removes the race where
+            # create_task() has returned but the coroutine has not yet incremented
+            # _active_tasks.
+            self._active_tasks += 1
+            scheduled_count += 1
             task = asyncio.create_task(
                 self._crawl_one(url, depth, seed_domain,
                                 same_domain_only, exclude_patterns, include_patterns)
@@ -502,26 +516,23 @@ class AsyncCrawler:
                 elapsed = now - t0
                 speed = len(self.visited_urls) / elapsed if elapsed else 0
                 logger.info(
-                    "Progress - visited=%d queued=%d active=%d failed=%d %.1f p/s",
+                    "Progress - visited=%d queued=%d active=%d failed=%d scheduled=%d %.1f p/s",
                     stats["visited"], stats["pending"],
-                    self._active_tasks, stats["failed"], speed,
+                    self._active_tasks, stats["failed"], scheduled_count, speed,
                 )
                 last_log = now
 
         # Wait for every in-flight worker to finish before returning.
-        # Without this, tasks spawned just before max_pages was hit are
-        # still running after crawl() returns, mutating visited_urls and
-        # potentially using a closed aiohttp session.
         if self._crawl_tasks:
             logger.info("Waiting for %d in-flight tasks...", len(self._crawl_tasks))
             await asyncio.gather(*list(self._crawl_tasks), return_exceptions=True)
 
         elapsed = time.perf_counter() - t0
         logger.info(
-            "Crawl done - %d pages in %.1fs (%.1f p/s) | %d failed",
+            "Crawl done - %d pages in %.1fs (%.1f p/s) | %d failed | %d scheduled",
             len(self.visited_urls), elapsed,
             len(self.visited_urls) / elapsed if elapsed else 0,
-            len(self.failed_urls),
+            len(self.failed_urls), scheduled_count,
         )
         return self.processed_urls
 
