@@ -520,7 +520,9 @@ class MultiStorage(DataStorage):
     three backends takes roughly the same time as saving to one.
 
     return_exceptions=True means if one backend fails, the others still
-    receive the data. The failure is logged, not raised.
+    receive the data. After every backend has had a chance to save, any
+    failures are raised as one RuntimeError so the caller knows the record
+    was not fully persisted.
     """
 
     def __init__(self, backends: list[DataStorage]) -> None:
@@ -531,10 +533,16 @@ class MultiStorage(DataStorage):
             *[b.save(data) for b in self._backends],
             return_exceptions=True,  # don't let one failure cancel the others
         )
-        # Log any exceptions without crashing
+
+        errors: list[str] = []
         for backend, result in zip(self._backends, results):
             if isinstance(result, Exception):
-                logger.error("%s save failed: %s", type(backend).__name__, result)
+                msg = f"{type(backend).__name__} save failed: {result}"
+                logger.error(msg)
+                errors.append(msg)
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     async def close(self) -> None:
         await asyncio.gather(*[b.close() for b in self._backends])

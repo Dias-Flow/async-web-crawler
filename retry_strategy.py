@@ -102,7 +102,14 @@ def classify_aiohttp_error(exc: Exception) -> CrawlerError:
     This is the "translation layer" between the HTTP library and our code.
     After this function, the rest of RetryStrategy only deals with
     CrawlerError subclasses and doesn't need to know about aiohttp internals.
+
+    Important: if the caller already raised one of our crawler-specific
+    exceptions, preserve it as-is.  A robots.txt PermanentError, for example,
+    must not be reclassified as a generic TransientError and retried.
     """
+    if isinstance(exc, CrawlerError):
+        return exc
+
     if isinstance(exc, aiohttp.ClientResponseError):
         # Server responded with an HTTP error code
         cls = HTTP_STATUS_MAP.get(exc.status)

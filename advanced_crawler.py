@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -310,7 +311,14 @@ class AdvancedCrawler:
         self._storage         = storage
 
         if log_file:
-            fh = logging.FileHandler(log_file, encoding="utf-8")
+            # Day 7 requires log rotation so long crawls do not grow one
+            # unbounded log file forever.  Keep the latest file plus 3 backups.
+            fh = RotatingFileHandler(
+                log_file,
+                maxBytes=5_000_000,
+                backupCount=3,
+                encoding="utf-8",
+            )
             fh.setFormatter(logging.Formatter(
                 "%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
             logging.getLogger().addHandler(fh)

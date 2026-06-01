@@ -13,7 +13,7 @@ import asyncio
 import json
 import pytest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 
 from retry_strategy import (
@@ -53,6 +53,13 @@ class TestClassify:
         exc = aiohttp.ClientConnectorError(MagicMock(), OSError("DNS failed"))
         err = classify_aiohttp_error(exc)
         assert isinstance(err, NetworkError)
+
+    def test_existing_crawler_error_is_preserved(self):
+        """Already-classified crawler errors must not be converted to TransientError."""
+        original = PermanentError("robots.txt disallows this URL")
+        err = classify_aiohttp_error(original)
+        assert err is original
+        assert isinstance(err, PermanentError)
 
 
 # ===========================================================================
@@ -255,6 +262,34 @@ class TestSQLiteStorage:
 # MultiStorage
 # ===========================================================================
 class TestMultiStorage:
+
+    async def test_raises_after_backend_failure(self):
+        """If any backend fails after its own retries, MultiStorage must notify caller."""
+        class GoodStorage:
+            def __init__(self):
+                self.saved = False
+            async def save(self, data):
+                self.saved = True
+            async def close(self):
+                pass
+            def get_stats(self):
+                return {}
+
+        class BadStorage:
+            async def save(self, data):
+                raise OSError("disk full")
+            async def close(self):
+                pass
+            def get_stats(self):
+                return {}
+
+        good = GoodStorage()
+        storage = MultiStorage([good, BadStorage()])
+
+        with pytest.raises(RuntimeError, match="BadStorage save failed"):
+            await storage.save({"url": "https://example.com"})
+
+        assert good.saved is True
 
     async def test_saves_to_all_backends(self, tmp_path):
         json_path = str(tmp_path / "out.jsonl")
