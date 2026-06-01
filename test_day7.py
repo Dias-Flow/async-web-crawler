@@ -127,3 +127,38 @@ class TestLoadConfig:
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             load_config(str(tmp_path / "nonexistent.yaml"))
+
+# ===========================================================================
+# HTML report escaping tests (mentor update 9)
+# ===========================================================================
+class TestHTMLReportEscaping:
+
+    def test_report_escapes_untrusted_page_data(self, tmp_path):
+        s = CrawlerStats()
+        malicious_url = 'https://example.com/?q=" onclick="alert(1)'
+        malicious_title = '<script>alert("xss")</script>'
+        s.record_page({
+            "url": malicious_url,
+            "title": malicious_title,
+            "links_count": 1,
+            "text_length": 10,
+            "fetch_elapsed": 0.1,
+            "status_code": 200,
+        })
+        s.finish()
+
+        out = str(tmp_path / "safe_report.html")
+        export_to_html_report(s, out, {
+            malicious_url: {
+                "url": malicious_url,
+                "title": malicious_title,
+                "links_count": 1,
+                "text_length": 10,
+            }
+        })
+
+        html = Path(out).read_text(encoding="utf-8")
+        assert "<script>" not in html
+        assert "onclick=\"alert" not in html
+        assert "&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;" in html
+        assert "rel=\"noopener noreferrer\"" in html

@@ -96,6 +96,48 @@ def _add_defaults(data: dict) -> dict:
         result["crawled_at"] = _now_iso()
     return result
 
+
+async def _retry_storage_operation(
+    operation,
+    *,
+    label: str,
+    max_attempts: int = 3,
+    base_delay: float = 0.2,
+    backoff_factor: float = 2.0,
+):
+    """
+    Run an async storage operation with retries and exponential backoff.
+
+    Day 6 requires write errors to be retried.  The previous implementation
+    only logged write errors and continued, which could silently lose data.
+    This helper logs every failed attempt and re-raises after the last attempt
+    so the caller knows the record was not saved.
+    """
+    attempts = max(1, max_attempts)
+    last_exc = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                logger.error(
+                    "%s failed after %d attempts: %s",
+                    label, attempts, exc,
+                )
+                raise
+
+            delay = base_delay * (backoff_factor ** (attempt - 1))
+            logger.warning(
+                "%s failed on attempt %d/%d: %s; retrying in %.2fs",
+                label, attempt, attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+
 # ===========================================================================
 # Abstract base class
 # ===========================================================================
@@ -170,23 +212,27 @@ class JSONStorage(DataStorage):
         """
         Append one JSON record to the file.
 
-        'async with aiofiles.open(...)' is the async equivalent of open().
-        The write is non-blocking — the event loop can run other coroutines
-        while the OS flushes bytes to disk.
+        Write failures are retried with exponential backoff.  If all attempts
+        fail, the exception is re-raised so AsyncCrawler/MultiStorage can log
+        that this specific record was not persisted.
         """
         # Save original data — links stays list, metadata stays dict,
         # matching the Day-6 standard structure exactly.
         record = _add_defaults(data)
         line = json.dumps(record, ensure_ascii=False, default=str)
 
-        try:
-            async with self._lock:  # one write at a time
-                async with aiofiles.open(self._path, mode="a", encoding="utf-8") as f:
-                    await f.write(line + "\n")
-            self._saved_count += 1
-            logger.debug("JSON saved: %s", record["url"])
-        except OSError as exc:
-            logger.error("JSON write error: %s", exc)
+        async def write_once() -> None:
+            async with aiofiles.open(self._path, mode="a", encoding="utf-8") as f:
+                await f.write(line + "\n")
+
+        async with self._lock:  # one write/retry sequence at a time
+            await _retry_storage_operation(
+                write_once,
+                label=f"JSON write for {record.get('url', '<unknown>')}",
+            )
+
+        self._saved_count += 1
+        logger.debug("JSON saved: %s", record["url"])
 
     async def close(self) -> None:
         logger.info("JSONStorage closed — %d records in %s", self._saved_count, self._path)
@@ -245,31 +291,36 @@ class CSVStorage(DataStorage):
             else:
                 flat[k] = v if v is not None else ""
 
-        # Auto-detect columns from first record
-        if not self._columns:
-            self._columns = list(flat.keys())
-
-        row = [flat.get(col, "") for col in self._columns]
-
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        if not self._header_written:
-            writer.writerow(self._columns)  # auto-detected headers
-        writer.writerow(row)
-        csv_text = buf.getvalue()
-
-        # Now write the string to disk asynchronously
         async with self._lock:
-            try:
+            # Auto-detect columns from first record.  This happens inside the
+            # lock so concurrent first saves cannot race and create different
+            # headers.
+            if not self._columns:
+                self._columns = list(flat.keys())
+
+            row = [flat.get(col, "") for col in self._columns]
+
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            if not self._header_written:
+                writer.writerow(self._columns)  # auto-detected headers
+            writer.writerow(row)
+            csv_text = buf.getvalue()
+
+            async def write_once() -> None:
                 async with aiofiles.open(
                     self._path, mode="a", encoding="utf-8", newline=""
                 ) as f:
                     await f.write(csv_text)
-                self._header_written = True
-                self._saved_count += 1
-                logger.debug("CSV saved: %s", record["url"])
-            except OSError as exc:
-                logger.error("CSV write error: %s", exc)
+
+            await _retry_storage_operation(
+                write_once,
+                label=f"CSV write for {record.get('url', '<unknown>')}",
+            )
+
+            self._header_written = True
+            self._saved_count += 1
+            logger.debug("CSV saved: %s", record["url"])
 
     async def close(self) -> None:
         logger.info("CSVStorage closed — %d rows in %s", self._saved_count, self._path)
@@ -346,6 +397,10 @@ class SQLiteStorage(DataStorage):
         self._lock = asyncio.Lock()
         self._saved_count: int = 0
 
+    async def init_db(self) -> None:
+        """Public method per Day-6 spec: create tables. Safe to call repeatedly."""
+        await self._connect()
+
     async def _connect(self) -> None:
         """Open DB and create tables on first use (lazy connection)."""
         if self._db is None:
@@ -354,10 +409,6 @@ class SQLiteStorage(DataStorage):
             await self._db.executescript(self.CREATE_TABLE_SQL)
             await self._db.commit()
             logger.info("SQLiteStorage connected — %s", self._db_path)
-
-    async def init_db(self) -> None:
-        """Public Day-6 API: create/open the SQLite database and tables."""
-        await self._connect()
 
     async def save(self, data: dict) -> None:
         """
@@ -379,19 +430,34 @@ class SQLiteStorage(DataStorage):
         Write all buffered records to SQLite in a single transaction.
         Must be called with self._lock already held.
 
-        executemany() runs the INSERT for each item in self._buffer.
-        commit() writes the whole batch to disk in one fsync.
+        The buffer is cleared only after a successful commit.  If SQLite keeps
+        failing after retries, the exception is re-raised and the buffered
+        records remain in memory for a later flush/close attempt.
         """
         if not self._buffer or self._db is None:
             return
-        try:
-            await self._db.executemany(self.INSERT_SQL, self._buffer)
-            await self._db.commit()
-            self._saved_count += len(self._buffer)
-            logger.debug("SQLite flushed %d records", len(self._buffer))
-            self._buffer.clear()
-        except aiosqlite.Error as exc:
-            logger.error("SQLite flush error: %s", exc)
+
+        batch = list(self._buffer)
+
+        async def flush_once() -> None:
+            try:
+                await self._db.executemany(self.INSERT_SQL, batch)
+                await self._db.commit()
+            except Exception:
+                try:
+                    await self._db.rollback()
+                except Exception as rollback_exc:
+                    logger.warning("SQLite rollback failed: %s", rollback_exc)
+                raise
+
+        await _retry_storage_operation(
+            flush_once,
+            label=f"SQLite flush of {len(batch)} records",
+        )
+
+        self._saved_count += len(batch)
+        logger.debug("SQLite flushed %d records", len(batch))
+        del self._buffer[:len(batch)]
 
     async def flush(self) -> None:
         """Public flush — call to force-write pending records without closing."""

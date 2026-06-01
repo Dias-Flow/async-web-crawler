@@ -314,3 +314,96 @@ class TestJSONStorageConcurrency:
             obj = json.loads(line)   # raises if line is corrupt
             assert "url" in obj
 
+
+# ===========================================================================
+# Storage retry tests (mentor update 9)
+# ===========================================================================
+class TestStorageRetries:
+
+    async def test_json_storage_retries_temporary_open_error(self, tmp_path, monkeypatch):
+        import aiofiles
+        from storage import JSONStorage
+
+        path = tmp_path / "retry.jsonl"
+        real_open = aiofiles.open
+        calls = {"n": 0}
+
+        def flaky_open(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("temporary json write error")
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(aiofiles, "open", flaky_open)
+        storage = JSONStorage(str(path))
+        await storage.save({"url": "https://retry-json.test", "title": "ok", "links": [], "metadata": {}})
+        await storage.close()
+
+        assert calls["n"] == 2
+        assert "retry-json.test" in path.read_text(encoding="utf-8")
+
+    async def test_csv_storage_retries_temporary_open_error(self, tmp_path, monkeypatch):
+        import aiofiles
+        from storage import CSVStorage
+
+        path = tmp_path / "retry.csv"
+        real_open = aiofiles.open
+        calls = {"n": 0}
+
+        def flaky_open(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("temporary csv write error")
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(aiofiles, "open", flaky_open)
+        storage = CSVStorage(str(path))
+        await storage.save({"url": "https://retry-csv.test", "title": "ok", "links": [], "metadata": {}})
+        await storage.close()
+
+        assert calls["n"] == 2
+        assert "retry-csv.test" in path.read_text(encoding="utf-8")
+
+    async def test_sqlite_flush_retries_and_keeps_buffer_until_success(self, tmp_path):
+        from storage import SQLiteStorage
+
+        class FakeDB:
+            def __init__(self):
+                self.calls = 0
+                self.commits = 0
+                self.rollbacks = 0
+
+            async def executemany(self, sql, batch):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary sqlite error")
+
+            async def commit(self):
+                self.commits += 1
+
+            async def rollback(self):
+                self.rollbacks += 1
+
+        storage = SQLiteStorage(str(tmp_path / "retry.db"), batch_size=10)
+        fake_db = FakeDB()
+        storage._db = fake_db
+        storage._buffer = [{
+            "url": "https://retry-sqlite.test",
+            "title": "ok",
+            "text": "",
+            "links_json": "[]",
+            "metadata_json": "{}",
+            "crawled_at": "2026-01-01T00:00:00+00:00",
+            "status_code": 200,
+            "content_type": "text/html",
+            "text_length": 0,
+            "links_count": 0,
+        }]
+
+        await storage.flush()
+
+        assert fake_db.calls == 2
+        assert fake_db.rollbacks == 1
+        assert fake_db.commits == 1
+        assert storage._buffer == []
+        assert storage.get_stats()["saved"] == 1

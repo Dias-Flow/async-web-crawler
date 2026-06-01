@@ -130,9 +130,6 @@ class TestBooksListingParser:
         """Check that relative href is correctly resolved against the listing URL."""
         parser = BooksListingParser()
         urls = parser.parse(LISTING_HTML, LISTING_URL)
-        # "a-light-in-the-attic_1000/index.html" relative to
-        # "http://books.toscrape.com/catalogue/page-1.html"
-        # should become:
         assert "http://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html" in urls
         assert "http://books.toscrape.com/catalogue/tipping-the-velvet_999/index.html" in urls
 
