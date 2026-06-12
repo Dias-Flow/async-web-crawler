@@ -364,12 +364,22 @@ class AsyncCrawler:
         self._all_done_event = asyncio.Event()
         self._crawl_tasks: set[asyncio.Task] = set()  # track every spawned task
 
-    def _should_crawl(self, url, seed_domain, same_domain_only,
+    def _should_crawl(self, url, seed_domains, same_domain_only,
                       exclude_patterns, include_patterns) -> bool:
         if self._queue.is_known(url):
             return False
         parsed = urlparse(url)
-        if same_domain_only and parsed.netloc != seed_domain:
+
+        # Day 3 allows multiple start URLs.  When same_domain_only=True,
+        # links should be allowed from ANY seed domain, not just the first one.
+        # Accept both the old str form and the new set/list form so internal
+        # helper calls remain backwards-compatible.
+        if isinstance(seed_domains, str):
+            allowed_domains = {seed_domains} if seed_domains else set()
+        else:
+            allowed_domains = set(seed_domains or [])
+
+        if same_domain_only and parsed.netloc not in allowed_domains:
             return False
         for pat in exclude_patterns:
             if re.search(pat, url):
@@ -379,7 +389,7 @@ class AsyncCrawler:
                 return False
         return True
 
-    async def _crawl_one(self, url: str, depth: int, seed_domain: str,
+    async def _crawl_one(self, url: str, depth: int, seed_domains,
                          same_domain_only: bool, exclude_patterns: list,
                          include_patterns: list) -> None:
         """
@@ -427,7 +437,7 @@ class AsyncCrawler:
 
             if depth < self.max_depth:
                 for link in page.get("links", []):
-                    if self._should_crawl(link, seed_domain, same_domain_only,
+                    if self._should_crawl(link, seed_domains, same_domain_only,
                                           exclude_patterns, include_patterns):
                         self._queue.add_url(link, depth=depth + 1)
 
@@ -446,7 +456,7 @@ class AsyncCrawler:
     ) -> dict[str, dict]:
         exclude_patterns = exclude_patterns or []
         include_patterns = include_patterns or []
-        seed_domain = urlparse(start_urls[0]).netloc if start_urls else ""
+        seed_domains = {urlparse(url).netloc for url in start_urls if urlparse(url).netloc}
 
         self._init_crawl_components()
 
@@ -455,8 +465,8 @@ class AsyncCrawler:
 
         t0 = time.perf_counter()
         last_log = t0
-        logger.info("Crawl started - seed=%s, max_pages=%d, max_depth=%d",
-                    seed_domain, max_pages, self.max_depth)
+        logger.info("Crawl started - seed_domains=%s, max_pages=%d, max_depth=%d",
+                    sorted(seed_domains), max_pages, self.max_depth)
 
         scheduled_count = 0
 
@@ -491,7 +501,7 @@ class AsyncCrawler:
             scheduled_count += 1
             self._active_tasks += 1
             task = asyncio.create_task(
-                self._crawl_one(url, depth, seed_domain,
+                self._crawl_one(url, depth, seed_domains,
                                 same_domain_only, exclude_patterns, include_patterns)
             )
             self._crawl_tasks.add(task)
@@ -501,10 +511,15 @@ class AsyncCrawler:
             if now - last_log >= 5:
                 stats = self._queue.get_stats()
                 elapsed = now - t0
-                speed = len(self.visited_urls) / elapsed if elapsed else 0
+                completed = len(self.visited_urls) + len(self.failed_urls)
+                speed = completed / elapsed if elapsed else 0
+                percent = min(100.0, (completed / max_pages) * 100) if max_pages else 100.0
+                remaining = max(max_pages - completed, 0)
+                eta = remaining / speed if speed > 0 else None
+                eta_text = f"{eta:.1f}s" if eta is not None else "unknown"
                 logger.info(
-                    "Progress - visited=%d queued=%d active=%d failed=%d %.1f p/s",
-                    stats["visited"], stats["pending"],
+                    "Progress - %.1f%% | ETA=%s | visited=%d queued=%d active=%d failed=%d %.1f p/s",
+                    percent, eta_text, stats["visited"], stats["pending"],
                     self._active_tasks, stats["failed"], speed,
                 )
                 last_log = now
@@ -534,6 +549,8 @@ class AsyncCrawler:
             stats["rate_limiter"] = self._rate_limiter.get_stats()
         if self._robots_parser:
             stats["robots"] = self._robots_parser.get_stats()
+        if self.retry_strategy:
+            stats["retry"] = self.retry_strategy.get_stats()
         return stats
 
     async def close(self) -> None:

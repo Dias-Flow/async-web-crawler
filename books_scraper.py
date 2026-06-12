@@ -418,20 +418,20 @@ class BooksScraper:
             # Polite delay before each listing page request
             await self._rate_limiter.acquire(current_url)
 
-            html = await self._crawler.fetch_url(current_url)
-            if not html:
+            result = await self._crawler.fetch_url(current_url)
+            if not result.success:
                 logger.warning("Failed to fetch listing page: %s", current_url)
                 break
 
             # Extract book URLs from this listing page
-            page_book_urls = self._listing_parser.parse(html, current_url)
+            page_book_urls = self._listing_parser.parse(result.content, current_url)
             all_book_urls.extend(page_book_urls)
 
             logger.info("  Page %s → %d books found (total: %d)",
                         current_url.split("/")[-1], len(page_book_urls), len(all_book_urls))
 
             # Find the next page link (None = we're on the last page)
-            current_url = self._listing_parser.has_next_page(html, current_url)
+            current_url = self._listing_parser.has_next_page(result.content, current_url)
 
         # Trim to max_books and deduplicate
         unique_urls = list(dict.fromkeys(all_book_urls))
@@ -450,14 +450,14 @@ class BooksScraper:
         Many of these run concurrently (controlled by AsyncCrawler's semaphore).
         """
         await self._rate_limiter.acquire(url)
-        html = await self._crawler.fetch_url(url)
+        result = await self._crawler.fetch_url(url)
 
-        if not html:
-            logger.warning("Failed to fetch book: %s", url)
+        if not result.success:
+            logger.warning("Failed to fetch book: %s — %s", url, result.error)
             self.failed_urls.append(url)
             return None
 
-        book = self._detail_parser.parse(html, url)
+        book = self._detail_parser.parse(result.content, url)
         logger.debug("Scraped: [%s] %s | £%s | %s",
                      book.rating, book.title[:40], book.price_excl_tax, book.genre)
         return book

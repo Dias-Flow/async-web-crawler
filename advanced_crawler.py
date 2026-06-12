@@ -311,8 +311,6 @@ class AdvancedCrawler:
         self._storage         = storage
 
         if log_file:
-            # Day 7 requires log rotation so long crawls do not grow one
-            # unbounded log file forever.  Keep the latest file plus 3 backups.
             fh = RotatingFileHandler(
                 log_file,
                 maxBytes=5_000_000,
@@ -351,6 +349,15 @@ class AdvancedCrawler:
 
         self.stats = CrawlerStats()
         self.results: dict[str, dict] = {}
+        self._progress_snapshot: dict = {
+            "scheduled": 0,
+            "completed": 0,
+            "percent": 0.0,
+            "eta_seconds": None,
+            "pages_per_second": 0.0,
+            "queued": 0,
+            "active": 0,
+        }
 
     # ------------------------------------------------------------------
     # FIX: _crawl_one_with_retry — the actual integration point
@@ -359,7 +366,7 @@ class AdvancedCrawler:
         self,
         url: str,
         depth: int,
-        seed_domain: str,
+        seed_domains,
         same_domain_only: bool,
         exclude_patterns: list[str],
         include_patterns: list[str],
@@ -465,7 +472,7 @@ class AdvancedCrawler:
                 import re
                 for link in page.get("links", []):
                     if self._crawler._should_crawl(
-                        link, seed_domain, same_domain_only,
+                        link, seed_domains, same_domain_only,
                         exclude_patterns, include_patterns,
                     ):
                         self._crawler._queue.add_url(link, depth=depth + 1)
@@ -476,6 +483,27 @@ class AdvancedCrawler:
                     and self._crawler._queue.pending_count() == 0
                     and self._crawler._all_done_event):
                 self._crawler._all_done_event.set()
+
+    def _update_progress_snapshot(self, scheduled_count: int, started_at: float) -> dict:
+        """Return and store Day-7 progress data: percent, ETA, speed, active tasks."""
+        elapsed = max(time.perf_counter() - started_at, 0.000001)
+        completed = len(self._crawler.visited_urls) + len(self._crawler.failed_urls)
+        speed = completed / elapsed if completed else 0.0
+        percent = min(100.0, (completed / self.max_pages) * 100) if self.max_pages else 100.0
+        remaining = max(self.max_pages - completed, 0)
+        eta_seconds = round(remaining / speed, 2) if speed > 0 and remaining > 0 else 0.0 if remaining == 0 else None
+        queued = self._crawler._queue.pending_count() if self._crawler._queue else 0
+
+        self._progress_snapshot = {
+            "scheduled": scheduled_count,
+            "completed": completed,
+            "percent": round(percent, 2),
+            "eta_seconds": eta_seconds,
+            "pages_per_second": round(speed, 3),
+            "queued": queued,
+            "active": self._crawler._active_tasks,
+        }
+        return self._progress_snapshot
 
     # ------------------------------------------------------------------
     async def crawl(self) -> dict[str, dict]:
@@ -490,7 +518,9 @@ class AdvancedCrawler:
 
         if self.use_sitemap and self.start_urls:
             sp = SitemapParser(self._crawler._session)
-            extra = await sp.discover_sitemap_urls(self.start_urls[0])
+            extra: list[str] = []
+            for start_url in self.start_urls:
+                extra.extend(await sp.discover_sitemap_urls(start_url))
             if extra:
                 logger.info("Sitemap discovered %d additional URLs", len(extra))
                 self.start_urls = list(dict.fromkeys(self.start_urls + extra))
@@ -498,7 +528,7 @@ class AdvancedCrawler:
         # Initialise queue, semaphores, rate limiter, robots parser
         self._crawler._init_crawl_components()
 
-        seed_domain = _up(self.start_urls[0]).netloc if self.start_urls else ""
+        seed_domains = {_up(url).netloc for url in self.start_urls if _up(url).netloc}
         for url in self.start_urls:
             self._crawler._queue.add_url(url, depth=0)
 
@@ -542,7 +572,7 @@ class AdvancedCrawler:
             self._crawler._active_tasks += 1
             task = asyncio.create_task(
                 self._crawl_one_with_retry(
-                    url, depth, seed_domain,
+                    url, depth, seed_domains,
                     self.same_domain_only,
                     self.exclude_patterns,
                     self.include_patterns,
@@ -555,11 +585,13 @@ class AdvancedCrawler:
             if now - last_log >= 5:
                 stats = self._crawler._queue.get_stats()
                 elapsed = now - t0
-                speed = len(self._crawler.visited_urls) / elapsed if elapsed else 0
+                progress = self._update_progress_snapshot(scheduled_count, t0)
+                eta = progress["eta_seconds"]
+                eta_text = f"{eta:.1f}s" if eta is not None else "unknown"
                 logger.info(
-                    "Progress — visited=%d | queued=%d | active=%d | %.1f p/s",
-                    stats["visited"], stats["pending"],
-                    self._crawler._active_tasks, speed,
+                    "Progress — %.1f%% | ETA=%s | visited=%d | queued=%d | active=%d | %.1f p/s",
+                    progress["percent"], eta_text, stats["visited"], stats["pending"],
+                    self._crawler._active_tasks, progress["pages_per_second"],
                 )
                 last_log = now
 
@@ -567,6 +599,7 @@ class AdvancedCrawler:
         if self._crawler._crawl_tasks:
             await asyncio.gather(*list(self._crawler._crawl_tasks), return_exceptions=True)
 
+        self._update_progress_snapshot(scheduled_count, t0)
         self.results = self._crawler.processed_urls
 
         for url, page in self.results.items():
@@ -577,7 +610,10 @@ class AdvancedCrawler:
         return self.results
 
     def get_stats(self) -> dict:
-        return self.stats.to_dict()
+        stats = self.stats.to_dict()
+        stats["progress"] = dict(self._progress_snapshot)
+        stats["retry"] = self._retry.get_stats()
+        return stats
 
     def export_to_html_report(self, output_path: str) -> None:
         export_to_html_report(self.stats, output_path, self.results)
